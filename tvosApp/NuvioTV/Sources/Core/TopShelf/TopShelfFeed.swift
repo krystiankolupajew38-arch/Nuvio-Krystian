@@ -69,7 +69,7 @@ public struct TopShelfEntry: Codable, Equatable {
     /// The app resolves URL-less synced and Next Up entries after opening.
     public var deepLinkURL: URL? {
         var components = URLComponents()
-        components.scheme = "nuvio-tv"
+        components.scheme = "nuvio-krystian"
         components.host = "continue-watching"
         components.queryItems = [
             URLQueryItem(name: "id", value: contentId),

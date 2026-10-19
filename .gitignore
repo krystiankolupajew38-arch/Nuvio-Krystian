@@ -69,3 +69,9 @@ tvosApp/NuvioTV.xcworkspace/
 # Signing.xcconfig itself IS tracked and optional-includes this file.
 tvosApp/Configurations/Signing.local.xcconfig
 /build_derived/
+
+# Local development tooling and signing material
+/.tools/
+*.mobileprovision
+*.p12
+*.p8

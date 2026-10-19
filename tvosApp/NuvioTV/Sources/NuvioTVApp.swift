@@ -943,7 +943,7 @@ struct ContentView: View {
             .first { $0.id == id }?.folder
     }
 
-    /// Handles Top Shelf, `nuvio://` / `nuvio-tv://` title open, and
+    /// Handles Top Shelf, `nuvio://` / `nuvio-krystian://` title open, and
     /// `stremio://` add-on install deep links. Deferred while login/profile gate
     /// is up so Top Shelf cold-launch still works.
     private func handleDeepLink(_ url: URL) {
@@ -955,9 +955,9 @@ struct ContentView: View {
             return
         }
 
-        // nuvio://meta?type=&id=  |  nuvio-tv://details?…  |  nuvio-tv://continue-watching?…
+        // nuvio://meta?type=&id=  |  nuvio-krystian://details?…  |  nuvio-krystian://continue-watching?…
         // Also accepts com.nuvio.app.tv and path-style /meta/… /details/…
-        guard ["nuvio", "nuvio-tv", "com.nuvio.app.tv"].contains(scheme) else { return }
+        guard ["nuvio", "nuvio-krystian", "com.nuvio.app.tv"].contains(scheme) else { return }
 
         // Infuse returns here after its player closes. Keep this before the
         // generic id guard: callback URLs intentionally carry only a session
@@ -1633,8 +1633,8 @@ struct ContentView: View {
                 profileID: profileID,
                 collectionContext: provenance
             )
-            successCallback = URL(string: "nuvio-tv://external-playback/\(id)")
-            errorCallback = URL(string: "nuvio-tv://external-playback/error/\(id)")
+            successCallback = URL(string: "nuvio-krystian://external-playback/\(id)")
+            errorCallback = URL(string: "nuvio-krystian://external-playback/error/\(id)")
         } else {
             externalSession = nil
             successCallback = nil

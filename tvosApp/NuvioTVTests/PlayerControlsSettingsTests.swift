@@ -2318,8 +2318,8 @@ final class ExternalPlayerTests: XCTestCase {
 
     func testSenPlayerXCallbacksArePercentEncoded() {
         let stream = URL(string: "https://cdn.example/movie.mkv?token=a&b=c")!
-        let success = URL(string: "nuvio-tv://external-playback/ABC-123")!
-        let error = URL(string: "nuvio-tv://external-playback/error/ABC-123")!
+        let success = URL(string: "nuvio-krystian://external-playback/ABC-123")!
+        let error = URL(string: "nuvio-krystian://external-playback/error/ABC-123")!
         let launch = ExternalPlayer.senplayer.launchURL(
             for: stream,
             successURL: success,
@@ -2327,9 +2327,9 @@ final class ExternalPlayerTests: XCTestCase {
         )!
 
         XCTAssertTrue(launch.absoluteString.starts(with: "senplayer://x-callback-url/play?url="))
-        XCTAssertTrue(launch.absoluteString.contains("x-success=nuvio-tv%3A%2F%2Fexternal-playback%2FABC-123"))
-        XCTAssertTrue(launch.absoluteString.contains("x-error=nuvio-tv%3A%2F%2Fexternal-playback%2Ferror%2FABC-123"))
-        XCTAssertFalse(launch.absoluteString.contains("x-success=nuvio-tv://"))
+        XCTAssertTrue(launch.absoluteString.contains("x-success=nuvio-krystian%3A%2F%2Fexternal-playback%2FABC-123"))
+        XCTAssertTrue(launch.absoluteString.contains("x-error=nuvio-krystian%3A%2F%2Fexternal-playback%2Ferror%2FABC-123"))
+        XCTAssertFalse(launch.absoluteString.contains("x-success=nuvio-krystian://"))
     }
 
     func testExternalPlayerSystemImagesAndLabels() {
