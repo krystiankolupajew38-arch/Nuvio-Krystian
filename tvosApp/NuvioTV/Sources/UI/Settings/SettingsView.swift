@@ -328,6 +328,7 @@ enum SettingsKey {
     static let fastNavigation = "nuvio.tv.settings.advanced.fastNavigation"
     static let smoothFocus = "nuvio.tv.settings.advanced.smoothFocus"
     static let playbackDiagnostics = "nuvio.tv.settings.advanced.playbackDiagnostics"
+    static let releaseDateDiagnostics = "nuvio.tv.settings.advanced.releaseDateDiagnostics"
     static let playbackDebug = "nuvio.tv.settings.advanced.playbackDebug"
     static let focusHighlighter = "nuvio.tv.settings.advanced.focusHighlighter"
     static let iCloudSyncEnabled = "nuvio.tv.settings.advanced.iCloudSyncEnabled"
@@ -341,7 +342,7 @@ enum SettingsKey {
     /// and never enter the account settings payload.
     static let deviceLocal = Set([
         traktConnected, traktClientID, traktClientSecret, simklClientID, wetrakrClientID, wetrakrClientSecret, wetrakrConnected, aiSubtitlesGeminiAPIKey,
-        p2pConsentAccepted, iCloudSyncEnabled, iCloudLastSyncDate, tmdbFollowAppLanguage
+        p2pConsentAccepted, iCloudSyncEnabled, iCloudLastSyncDate, tmdbFollowAppLanguage, releaseDateDiagnostics
     ])
 
     static let all = [
@@ -389,7 +390,7 @@ enum SettingsKey {
         playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, seekPreviewEnabled, showLoadingStatus,
         audioDelayPersistEnabled, persistentAudioDelayMs,
         sceneFeatureEnabled,
-        fastNavigation, smoothFocus, playbackDiagnostics, playbackDebug, focusHighlighter,
+        fastNavigation, smoothFocus, playbackDiagnostics, releaseDateDiagnostics, playbackDebug, focusHighlighter,
         iCloudSyncEnabled, iCloudLastSyncDate
     ] + SubtitleStyleKey.all
 }
@@ -9108,6 +9109,7 @@ private struct AdvancedSettingsView: View {
     @State private var showingPlaybackHistory = false
     @AppStorage(SettingsKey.fastNavigation) private var fastNavigation = false
     @AppStorage(SettingsKey.playbackDiagnostics) private var playbackDiagnostics = false
+    @AppStorage(SettingsKey.releaseDateDiagnostics) private var releaseDateDiagnostics = false
     @AppStorage(SettingsKey.playbackDebug) private var playbackDebug = false
     @State private var isClearingTestHistory = false
     @State private var testHistoryStatus = ContinueWatchingTestData.status
@@ -9144,6 +9146,13 @@ private struct AdvancedSettingsView: View {
                     title: L10n.string("tvos_settings_playback_issue_reports", fallback: "Playback Issue Reports"),
                     subtitle: L10n.string("tvos_settings_keep_diagnostic_snapshots_after_failed_p_cd841397", fallback: "Keep diagnostic snapshots after failed playback attempts"),
                     isOn: $playbackDiagnostics,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: "Release Date Diagnostics",
+                    subtitle: "Log selected metadata provider priority, episode date precision and local day only. No add-on URLs, tokens or stream links.",
+                    isOn: $releaseDateDiagnostics,
                     accentColor: accentColor
                 )
 
