@@ -1824,6 +1824,9 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
     let streamUrl: String
     let position: Double
     let duration: Double
+    /// Percentage reported directly by a tracking provider, independently of
+    /// runtime. Nil for exact local positions and old persisted rows.
+    let explicitProgressPercent: Double?
     let lastWatchedAt: Date
     /// Which episode this progress belongs to (nil for movies and for entries
     /// saved before episode tracking existed — optionals keep old JSON decoding).
@@ -1936,12 +1939,16 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
         episodeOverviewOverride: String? = nil,
         episodeThumbnailOverride: String? = nil,
         isUpNext: Bool? = nil,
-        upNextSeedSeason: Int? = nil
+        upNextSeedSeason: Int? = nil,
+        explicitProgressPercent: Double? = nil
     ) {
         self.meta = meta
         self.streamUrl = streamUrl
         self.position = position
         self.duration = duration
+        self.explicitProgressPercent = explicitProgressPercent.flatMap {
+            $0.isFinite && (0...100).contains($0) ? $0 : nil
+        }
         self.lastWatchedAt = lastWatchedAt
         self.season = season
         self.episode = episode
@@ -1968,6 +1975,7 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
         streamUrl = try container.decode(String.self, forKey: .streamUrl)
         position = try container.decode(Double.self, forKey: .position)
         duration = try container.decode(Double.self, forKey: .duration)
+        explicitProgressPercent = try container.decodeIfPresent(Double.self, forKey: .explicitProgressPercent)
         lastWatchedAt = try container.decode(Date.self, forKey: .lastWatchedAt)
         season = try container.decodeIfPresent(Int.self, forKey: .season)
         episode = try container.decodeIfPresent(Int.self, forKey: .episode)
@@ -1991,6 +1999,7 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
         case streamUrl
         case position
         case duration
+        case explicitProgressPercent
         case lastWatchedAt
         case season
         case episode
@@ -2115,21 +2124,38 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
     }
 
     var progress: Double {
+        if let explicitProgressPercent, explicitProgressPercent.isFinite,
+           (0...100).contains(explicitProgressPercent) {
+            return explicitProgressPercent / 100
+        }
         guard duration > 0 else { return 0 }
         return min(max(position / duration, 0), 1)
     }
 
+    /// Only a real saved position is safe to hand to an external player. An
+    /// explicit Trakt percentage with unknown duration is not a timestamp.
     var resumePosition: Double {
-        // The phone preserves duration-less playback positions. A zero runtime
-        // must not turn an Infuse callback into a restart at the beginning.
+        if duration <= 0, explicitProgressPercent != nil, position <= 0 { return 0 }
         guard duration > 0 else { return max(0, position) }
         return max(0, min(position, max(duration - 5, 0)))
+    }
+
+    /// Used only by the built-in player after it knows the actual stream length.
+    var resumeProgressFraction: Double? {
+        guard duration <= 0, position <= 0, let explicitProgressPercent,
+              explicitProgressPercent > 0, explicitProgressPercent < 90 else { return nil }
+        return explicitProgressPercent / 100
     }
 
     var remainingText: String {
         // Synced rows can arrive without a runtime; there is no honest number to
         // show for those, so offer the action instead.
-        guard duration > 0 else { return L10n.string("action_resume", fallback: "Resume").uppercased() }
+        guard duration > 0 else {
+            if let explicitProgressPercent, explicitProgressPercent > 0 {
+                return "\(Int(explicitProgressPercent.rounded()))% watched"
+            }
+            return L10n.string("action_resume", fallback: "Resume").uppercased()
+        }
         let remaining = max(0, duration - position)
         let minutes = Int(remaining / 60)
         let hours = minutes / 60
@@ -2146,6 +2172,7 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
             && streamUrl == other.streamUrl
             && position == other.position
             && duration == other.duration
+            && explicitProgressPercent == other.explicitProgressPercent
             && lastWatchedAt == other.lastWatchedAt
             && season == other.season
             && episode == other.episode
