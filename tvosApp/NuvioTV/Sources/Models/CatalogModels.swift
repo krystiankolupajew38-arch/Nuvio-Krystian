@@ -2584,6 +2584,7 @@ enum ContinueWatchingStore {
         }
     }
 
+    @discardableResult
     static func save(
         meta: NuvioMeta,
         streamUrl: String,
@@ -2591,8 +2592,9 @@ enum ContinueWatchingStore {
         duration: Double,
         season: Int? = nil,
         episode: Int? = nil,
-        episodeId: String? = nil
-    ) {
+        episodeId: String? = nil,
+        requireVerifiedWrite: Bool = false
+    ) -> Bool {
         // A temporarily unavailable MPV time-pos must not erase a valid resume
         // point. Only a coherent, started sample is allowed to replace/remove
         // existing progress.
@@ -2601,26 +2603,23 @@ enum ContinueWatchingStore {
               position > 0,
               duration >= 60 else {
             print("[ContinueWatching][Store] save rejected: meta=\(meta.id), pos=\(position), dur=\(duration)")
-            return
+            return false
         }
 
-        // If an item for this title already exists and has the same episode, stream,
-        // and playback position within 1 second, the progress is unchanged.
         let existing = item(for: meta.id)
-        if let existing,
+        if !requireVerifiedWrite, let existing,
            existing.season == (season ?? existing.season),
            existing.episode == (episode ?? existing.episode),
            abs(existing.position - position) < 1.0,
            existing.streamUrl == streamUrl {
-            return
+            return true
         }
-
         print("[ContinueWatching][Store] save: meta=\(meta.id), S\(season.map(String.init) ?? "nil")E\(episode.map(String.init) ?? "nil"), pos=\(position)/\(duration)")
 
         // Record the raw row before any display rule runs. A finished episode is
         // not "nothing to store" — it is precisely the seed that produces the
         // next episode's Next Up card, here and on every other device.
-        WatchProgressLedger.upsert(
+        guard WatchProgressLedger.upsert(
             WatchProgressRecord(
                 progressKey: WatchProgressLedger.progressKey(
                     contentId: meta.id,
@@ -2641,7 +2640,7 @@ enum ContinueWatchingStore {
                 lastWatchedAt: Date(),
                 isPendingPush: true
             )
-        )
+        ) else { return false }
 
         guard shouldKeep(position: position, duration: duration) else {
             print("[ContinueWatching][Store] save: shouldKeep=false (pos=\(position)/dur=\(duration) >= \(WatchProgressLedger.completionFraction)) -> removing from store")
@@ -2649,11 +2648,11 @@ enum ContinueWatchingStore {
                 removeEpisodeResumePoint(meta: meta, season: season, episode: episode)
             }
             remove(metaId: meta.id, retainingLedger: true)
-            return
+            return true
         }
 
         if meta.isSeries, let season, let episode {
-            saveEpisodeResumePoint(
+            guard saveEpisodeResumePoint(
                 meta: meta,
                 season: season,
                 episode: episode,
@@ -2661,7 +2660,7 @@ enum ContinueWatchingStore {
                 position: position,
                 duration: duration,
                 updatedAt: Date()
-            )
+            ) else { return false }
         }
 
         // A save that doesn't know its episode (resume paths that only carry a
@@ -2678,7 +2677,7 @@ enum ContinueWatchingStore {
         )
         let updated = ([item] + items().filter { $0.meta.id != meta.id }).prefix(maxItems)
         print("[ContinueWatching][Store] save: persisting \(updated.count) items in store")
-        persist(Array(updated))
+        return persist(Array(updated))
     }
 
     /// Records a genuine watch-through.
@@ -2688,16 +2687,17 @@ enum ContinueWatchingStore {
     /// here and on every other device. Position-at-runtime is how the phone
     /// marks a finished row, and it is the only completion signal the sync
     /// payload can carry — there is no `is_completed` column on the wire.
+    @discardableResult
     static func markPlaybackCompleted(
         meta: NuvioMeta,
         duration: Double,
         season: Int? = nil,
         episode: Int? = nil
-    ) {
-        guard duration.isFinite, duration > 0 else { return }
+    ) -> Bool {
+        guard duration.isFinite, duration > 0 else { return false }
         print("[ContinueWatching][Store] markPlaybackCompleted: meta=\(meta.id), S\(season.map(String.init) ?? "nil")E\(episode.map(String.init) ?? "nil"), dur=\(duration)")
         ContinueWatchingDismissStore.clear(contentId: meta.id)
-        WatchProgressLedger.upsert(
+        guard WatchProgressLedger.upsert(
             WatchProgressRecord(
                 progressKey: WatchProgressLedger.progressKey(
                     contentId: meta.id,
@@ -2718,11 +2718,12 @@ enum ContinueWatchingStore {
                 lastWatchedAt: Date(),
                 isPendingPush: true
             )
-        )
+        ) else { return false }
         if let season, let episode {
             removeEpisodeResumePoint(meta: meta, season: season, episode: episode)
         }
         remove(metaId: meta.id, retainingLedger: true)
+        return true
     }
 
     /// Display-only "Next Up" suggestion. Deliberately absent from the ledger: a
@@ -3022,13 +3023,15 @@ enum ContinueWatchingStore {
         return legacy
     }
 
-    private static func persistEpisodeResumePoints(_ points: [EpisodeResumePoint]) {
-        guard let data = try? makeEncoder().encode(points) else { return }
-        if LargePayloadStore.write(data, key: episodeResumeStorageKey, directory: episodeResumeDirectoryName) {
-            UserDefaults.standard.removeObject(forKey: episodeResumeStorageKey)
-        }
+    @discardableResult
+    private static func persistEpisodeResumePoints(_ points: [EpisodeResumePoint]) -> Bool {
+        guard let data = try? makeEncoder().encode(points) else { return false }
+        guard LargePayloadStore.write(data, key: episodeResumeStorageKey, directory: episodeResumeDirectoryName) else { return false }
+        UserDefaults.standard.removeObject(forKey: episodeResumeStorageKey)
+        return true
     }
 
+    @discardableResult
     private static func saveEpisodeResumePoint(
         meta: NuvioMeta,
         season: Int,
@@ -3037,17 +3040,17 @@ enum ContinueWatchingStore {
         position: Double,
         duration: Double,
         updatedAt: Date
-    ) {
-        guard position > 5 else { return }
+    ) -> Bool {
+        guard position > 5 else { return true }
         guard shouldKeep(position: position, duration: duration) else {
             removeEpisodeResumePoint(meta: meta, season: season, episode: episode)
-            return
+            return false
         }
         let current = episodeResumePoints()
         if let existing = current.first(where: {
             resumePoint($0, matches: meta, season: season, episode: episode, episodeId: episodeId)
         }), existing.updatedAt > updatedAt {
-            return
+            return false
         }
         let point = EpisodeResumePoint(
             metaId: meta.id,
@@ -3063,7 +3066,7 @@ enum ContinueWatchingStore {
         let updated = ([point] + current.filter {
             !resumePoint($0, matches: meta, season: season, episode: episode, episodeId: episodeId)
         }).prefix(maxEpisodeResumePoints)
-        persistEpisodeResumePoints(Array(updated))
+        return persistEpisodeResumePoints(Array(updated))
     }
 
     private static func removeEpisodeResumePoint(meta: NuvioMeta, season: Int, episode: Int) {
@@ -7842,7 +7845,9 @@ enum WatchedStore {
         ContinueWatchingStore.markLedgerWatched(meta: meta, season: item.season, episode: item.episode)
         ContinueWatchingStore.removeWatched([item])
         let markedAt = item.watchedAt
+        let markedProfileID = activeProfileId
         Task { @MainActor in
+            guard activeProfileId == markedProfileID, ProfileSettings.activeProfileID == markedProfileID else { return }
             TraktProgressService.forgetLocalPlayback(
                 meta: meta,
                 season: item.season,
@@ -7882,7 +7887,7 @@ enum WatchedStore {
                     episode: item.episode,
                     isWatched: true,
                     store: traktStore,
-                    profileScope: activeProfileId
+                    profileScope: profileId
                 )
             }
         }
@@ -7924,7 +7929,9 @@ enum WatchedStore {
         ContinueWatchingStore.markLedgerWatched(meta: meta, season: season, episode: episode)
         ContinueWatchingStore.removeWatched([item])
         let markedAt = item.watchedAt
+        let markedProfileID = activeProfileId
         Task { @MainActor in
+            guard activeProfileId == markedProfileID, ProfileSettings.activeProfileID == markedProfileID else { return }
             TraktProgressService.forgetLocalPlayback(
                 meta: meta,
                 season: season,

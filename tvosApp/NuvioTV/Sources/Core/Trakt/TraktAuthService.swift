@@ -1265,16 +1265,17 @@ struct TraktProgressService {
         return decoded
     }
 
-    private static func saveCheckpoints(_ checkpoints: [LocalPlaybackCheckpoint]) {
+    @discardableResult
+    private static func saveCheckpoints(_ checkpoints: [LocalPlaybackCheckpoint]) -> Bool {
         guard !checkpoints.isEmpty else {
             LargePayloadStore.remove(key: checkpointStorageKey, directory: checkpointDirectoryName)
             UserDefaults.standard.removeObject(forKey: checkpointStorageKey)
-            return
+            return true
         }
-        guard let data = try? checkpointEncoder().encode(checkpoints) else { return }
-        if LargePayloadStore.write(data, key: checkpointStorageKey, directory: checkpointDirectoryName) {
-            UserDefaults.standard.removeObject(forKey: checkpointStorageKey)
-        }
+        guard let data = try? checkpointEncoder().encode(checkpoints) else { return false }
+        guard LargePayloadStore.write(data, key: checkpointStorageKey, directory: checkpointDirectoryName) else { return false }
+        UserDefaults.standard.removeObject(forKey: checkpointStorageKey)
+        return true
     }
 
     private static func checkpointEncoder() -> JSONEncoder {
@@ -1321,6 +1322,7 @@ struct TraktProgressService {
             .items.first(where: { WatchedStore.sameContent($0.meta, meta) })
     }
 
+    @discardableResult
     static func recordLocalPlayback(
         meta: NuvioMeta,
         position: Double,
@@ -1329,11 +1331,11 @@ struct TraktProgressService {
         episode: Int?,
         source sourceOverride: TraktWatchProgressSource? = nil,
         notify: Bool
-    ) {
+    ) -> Bool {
         guard position.isFinite,
               duration.isFinite,
               position > 0,
-              duration > 0 else { return }
+              duration > 0 else { return false }
 
         let profileId = ContinueWatchingStore.activeProfileId
         let source = sourceOverride ?? TraktSettingsStore.watchProgressSource
@@ -1342,7 +1344,8 @@ struct TraktProgressService {
         // Going back to a title retires the removal the user made earlier, so a
         // provider row they are actively watching again is never hidden.
         ContinueWatchingDismissStore.clear(contentId: meta.id)
-        localPlaybackCheckpoints.removeAll {
+        var checkpoints = localPlaybackCheckpoints
+        checkpoints.removeAll {
             $0.profileId == profileId
                 && $0.source == source
                 && WatchedStore.sameContent($0.item.meta, meta)
@@ -1353,7 +1356,7 @@ struct TraktProgressService {
             let video = meta.videos?.first {
                 $0.season == season && $0.episode == episode
             }
-            localPlaybackCheckpoints.append(
+            checkpoints.append(
                 LocalPlaybackCheckpoint(
                     profileId: profileId,
                     source: source,
@@ -1383,12 +1386,15 @@ struct TraktProgressService {
             }
         }
 
+        guard saveCheckpoints(checkpoints) else { return false }
+        cachedCheckpoints = checkpoints
         if notify {
             NotificationCenter.default.post(
                 name: TraktSettingsStore.continueWatchingChangedNotification,
                 object: nil
             )
         }
+        return true
     }
 
     /// Drops a title from the optimistic layers that sit in front of the

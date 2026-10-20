@@ -456,6 +456,7 @@ struct ExternalPlaybackCallback: Equatable {
     let isError: Bool
     let progress: Double?
     let position: Double?
+    var duration: Double? = nil
 
     static func parse(_ url: URL) -> ExternalPlaybackCallback? {
         guard url.scheme?.lowercased() == "nuvio-krystian",
@@ -471,7 +472,7 @@ struct ExternalPlaybackCallback: Equatable {
             return value
         }
         let progress: Double?
-        if let value = number("progress") {
+        if !isError, let value = number("progress") {
             guard (0...1).contains(value) else { return nil }
             progress = value
         } else {
@@ -481,7 +482,8 @@ struct ExternalPlaybackCallback: Equatable {
             id: id,
             isError: isError,
             progress: progress,
-            position: number("position")
+            position: number("position"),
+            duration: number("duration")
         )
     }
 }
@@ -498,6 +500,23 @@ struct ExternalPlaybackSession: Codable, Equatable {
     let duration: Double?
     let profileID: String?
     var collectionContext: CollectionPlaybackContext? = nil
+    var startedAt: Date? = nil
+    var progressSource: String? = nil
+    var completionAccounts: [String: String]? = nil
+
+    /// Infuse documents position in seconds. Never invent a runtime for a
+    /// percentage-only callback; that would manufacture a cross-device resume.
+    func sample(for callback: ExternalPlaybackCallback) -> (position: Double, duration: Double)? {
+        guard !callback.isError, callback.id == id,
+              !meta.isSeries || (season != nil && episode != nil),
+              let runtime = callback.duration ?? duration,
+              runtime.isFinite, runtime >= 60 else { return nil }
+        let position = callback.position ?? callback.progress.map { $0 * runtime }
+        guard let position, position.isFinite,
+              position >= WatchProgressLedger.minimumTrackableSeconds,
+              position <= runtime else { return nil }
+        return (position, runtime)
+    }
 }
 
 enum ExternalPlaybackSessionStore {
@@ -515,7 +534,10 @@ enum ExternalPlaybackSessionStore {
             episode: session.episode,
             duration: session.duration,
             profileID: session.profileID,
-            collectionContext: session.collectionContext
+            collectionContext: session.collectionContext,
+            startedAt: session.startedAt,
+            progressSource: session.progressSource,
+            completionAccounts: session.completionAccounts
         )
         guard let data = try? JSONEncoder().encode(compactSession) else { return }
         defaults.set(data, forKey: key)
@@ -538,6 +560,112 @@ enum ExternalPlaybackSessionStore {
               session.profileID == profileID else { return nil }
         defaults.removeObject(forKey: key)
         return session
+    }
+}
+
+/// Main-actor transaction: validate, persist, acknowledge, then sync. No await
+/// may occur before acknowledgement, so a profile switch cannot split writes.
+@MainActor
+enum ExternalPlaybackReturnHandler {
+    @discardableResult
+    static func handle(
+        _ callback: ExternalPlaybackCallback,
+        profileID: String?,
+        defaults: UserDefaults = .standard,
+        persist: ((ExternalPlaybackSession, Double, Double) -> Bool)? = nil
+    ) -> Bool {
+        guard let session = ExternalPlaybackSessionStore.load(defaults: defaults),
+              session.id == callback.id, session.profileID == profileID else { return false }
+        if callback.isError {
+            _ = ExternalPlaybackSessionStore.consume(id: session.id, profileID: session.profileID, defaults: defaults)
+            return false
+        }
+        guard let sample = session.sample(for: callback) else { return false }
+        let saved = persist?(session, sample.position, sample.duration)
+            ?? persistPlayback(session, position: sample.position, duration: sample.duration)
+        guard saved else { return false }
+        _ = ExternalPlaybackSessionStore.consume(id: session.id, profileID: session.profileID, defaults: defaults)
+        return true
+    }
+
+    private static func persistPlayback(_ session: ExternalPlaybackSession, position: Double, duration: Double) -> Bool {
+        let profileID = session.profileID
+        guard ProfileSettings.activeProfileID == profileID,
+              WatchedStore.activeProfileId == profileID,
+              ContinueWatchingStore.activeProfileId == profileID,
+              WatchProgressLedger.activeProfileId == profileID else { return false }
+        let store = ProfileSettings.store(for: profileID)
+        let source = TraktSettingsStore.watchProgressSource(in: store)
+        guard session.progressSource == nil || session.progressSource == source.rawValue else { return false }
+        let remote = source != .nuvioSync
+        guard !remote || RemoteTrackingState.isProgressSourceAuthenticated(in: store) else { return false }
+        if source == .trakt, let account = session.completionAccounts?[TraktWatchProgressSource.trakt.rawValue],
+           TraktHistoryService.completionAccountID(in: store, profileId: profileID) != account { return false }
+        if source == .wetrakr, let account = session.completionAccounts?[TraktWatchProgressSource.wetrakr.rawValue],
+           WeTrakrProgressService.completionAccountID(in: store, profileId: profileID) != account { return false }
+        let threshold = source == .mdblist && remote
+            ? MdbListProgressService.completionPercent / 100 : WatchProgressLedger.completionFraction
+        let completed = position / duration >= threshold
+
+        // A later local or pulled sample wins over a delayed external return.
+        // Matching values allow retry after a partially successful disk write.
+        if let startedAt = session.startedAt {
+            if !remote, let row = WatchProgressLedger.record(contentId: session.meta.id, season: session.season, episode: session.episode),
+               row.lastWatchedAt > startedAt,
+               row.position != position && !(completed && row.position == duration) { return false }
+            if remote, let row = TraktProgressService.currentContinueWatchingItem(for: session.meta),
+               row.season == session.season, row.episode == session.episode,
+               row.lastWatchedAt > startedAt, row.position != position { return false }
+            if let row = WatchedStore.items().first(where: {
+                WatchedStore.sameContent($0.meta, session.meta) && $0.season == session.season && $0.episode == session.episode
+            }), row.watchedAt > startedAt,
+               row.lastCountedPlaybackIDsBySource[source.rawValue] != session.id { return false }
+        }
+
+        if completed {
+            if !remote {
+                guard ContinueWatchingStore.markPlaybackCompleted(
+                    meta: session.meta, duration: duration, season: session.season, episode: session.episode
+                ) else { return false }
+            }
+            guard WatchedStore.recordPlaybackCompletion(
+                session.meta, season: session.season, episode: session.episode,
+                completionID: session.id, source: source, completionAccounts: session.completionAccounts
+            ) else { return false }
+            Task { @MainActor in
+                _ = await TraktProgressService.finishPlaybackForHistory(
+                    meta: session.meta, position: position, duration: duration,
+                    season: session.season, episode: session.episode, store: store,
+                    profileId: profileID, completionID: session.id, source: source,
+                    expectedAccountID: session.completionAccounts?[source.rawValue],
+                    traktMirrorAccountID: source == .trakt ? nil : session.completionAccounts?[TraktWatchProgressSource.trakt.rawValue]
+                )
+            }
+        } else if remote {
+            guard TraktProgressService.recordLocalPlayback(
+                meta: session.meta, position: position, duration: duration,
+                season: session.season, episode: session.episode, source: source, notify: true
+            ) else { return false }
+            Task { @MainActor in
+                guard ProfileSettings.activeProfileID == profileID, ProfileSettings.isActiveStore(store) else { return }
+                _ = await TraktProgressService.reportPlayback(
+                    meta: session.meta, position: position, duration: duration,
+                    season: session.season, episode: session.episode, action: .pause,
+                    store: store, sourceOverride: source,
+                    expectedAccountID: session.completionAccounts?[source.rawValue], profileId: profileID
+                )
+            }
+        } else {
+            guard ContinueWatchingStore.save(
+                meta: session.meta, streamUrl: session.sourceURL, position: position,
+                duration: duration, season: session.season, episode: session.episode, requireVerifiedWrite: true
+            ) else { return false }
+            ContinueWatchingDismissStore.clear(contentId: session.meta.id)
+        }
+        if let context = session.collectionContext {
+            CollectionPlaybackOriginStore.recordStarted(meta: session.meta, context: context, activeProfileID: profileID)
+        }
+        return true
     }
 }
 

@@ -1016,105 +1016,9 @@ struct ContentView: View {
     }
 
     private func handleExternalPlaybackCallback(_ callback: ExternalPlaybackCallback) {
-        let profileID = profileViewModel.activeProfile?.id ?? WatchedStore.activeProfileId
-        guard let session = ExternalPlaybackSessionStore.consume(id: callback.id, profileID: profileID) else {
-            return
-        }
-        // An Infuse error callback means the handoff failed. Consuming the
-        // session still makes retries/idempotent duplicate callbacks harmless.
-        guard !callback.isError else { return }
-
-        let duration = session.duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
-        let progress = callback.progress ?? callback.position.flatMap { position in
-            guard let duration, position.isFinite, position >= 0 else { return nil }
-            return position / duration
-        }
-        guard let progress, progress.isFinite, (0...1).contains(progress) else { return }
-
-        let isEpisode = session.meta.isSeries && session.season != nil && session.episode != nil
-        guard !session.meta.isSeries || isEpisode else { return }
-
-        if progress > 0, let context = session.collectionContext {
-            CollectionPlaybackOriginStore.recordStarted(
-                meta: session.meta, context: context,
-                activeProfileID: profileID
-            )
-        }
-
-        if RemoteTrackingState.isProgressSourceAuthenticated {
-            // Keep the provider-backed path aligned with built-in playback:
-            // optimistic local state plus one pause/stop report. A zero
-            // fraction is an Infuse close-before-play signal, not playback.
-            let completionFraction = TraktSettingsStore.watchProgressSource == .mdblist
-                ? MdbListProgressService.completionPercent / 100
-                : WatchProgressLedger.completionFraction
-            if progress > 0 {
-                let reportDuration = duration ?? 100
-                let reportPosition = duration.map { $0 * progress } ?? (100 * progress)
-                let action: TraktScrobbleAction = progress >= completionFraction
-                    ? .stop
-                    : .pause
-                let store = ProfileSettings.current
-                if let duration {
-                    TraktProgressService.recordLocalPlayback(
-                        meta: session.meta,
-                        position: reportPosition,
-                        duration: duration,
-                        season: session.season,
-                        episode: session.episode,
-                        notify: action == .stop
-                    )
-                }
-                Task {
-                    _ = await TraktProgressService.reportPlayback(
-                        meta: session.meta,
-                        position: reportPosition,
-                        duration: reportDuration,
-                        season: session.season,
-                        episode: session.episode,
-                        action: action,
-                        store: store
-                    )
-                }
-            }
-            if progress >= completionFraction {
-                _ = WatchedStore.markWatched(
-                    session.meta,
-                    season: session.season,
-                    episode: session.episode
-                )
-            }
-            return
-        }
-
-        if progress >= WatchProgressLedger.completionFraction {
-            if let duration {
-                ContinueWatchingStore.markPlaybackCompleted(
-                    meta: session.meta,
-                    duration: duration,
-                    season: session.season,
-                    episode: session.episode
-                )
-            }
-            _ = WatchedStore.markWatched(
-                session.meta,
-                season: session.season,
-                episode: session.episode
-            )
-        } else if let duration, progress > 0 {
-            let position = duration * progress
-            if position >= WatchProgressLedger.minimumTrackableSeconds {
-                ContinueWatchingDismissStore.clear(contentId: session.meta.id)
-            }
-            ContinueWatchingStore.save(
-                meta: session.meta,
-                streamUrl: session.sourceURL,
-                position: position,
-                duration: duration,
-                season: session.season,
-                episode: session.episode
-            )
-        }
+        ExternalPlaybackReturnHandler.handle(
+            callback, profileID: profileViewModel.activeProfile?.id ?? WatchedStore.activeProfileId
+        )
     }
 
     /// `stremio://…/manifest.json` installs the add-on (same as pasting the URL).
@@ -1623,15 +1527,33 @@ struct ContentView: View {
         if !isActionPlaybackSession && (player == .infuse || player == .senplayer || player == .nativePlayer) {
             let id = UUID().uuidString
             let profileID = profileViewModel.activeProfile?.id ?? WatchedStore.activeProfileId
+            var completionAccounts: [String: String] = [:]
+            let source = TraktSettingsStore.watchProgressSource(in: store)
+            if source == .trakt || RemoteTrackingState.shouldMirrorWatchedHistoryToTrakt(in: store),
+               let account = TraktHistoryService.completionAccountID(in: store, profileId: profileID) {
+                completionAccounts[TraktWatchProgressSource.trakt.rawValue] = account
+            }
+            if source == .wetrakr,
+               let account = WeTrakrProgressService.completionAccountID(in: store, profileId: profileID) {
+                completionAccounts[TraktWatchProgressSource.wetrakr.rawValue] = account
+            }
+            let priorProgress = WatchProgressLedger.record(
+                contentId: meta.id, season: meta.isSeries ? numbers?.season : nil,
+                episode: meta.isSeries ? numbers?.episode : nil
+            )
             externalSession = ExternalPlaybackSession(
                 id: id,
                 meta: meta.persistenceSnapshot,
                 sourceURL: url.absoluteString,
                 season: meta.isSeries ? numbers?.season : nil,
                 episode: meta.isSeries ? numbers?.episode : nil,
-                duration: Self.runtimeSeconds(meta.runtime),
+                duration: priorProgress.flatMap { $0.duration > 0 ? $0.duration : nil }
+                    ?? Self.runtimeSeconds(meta.runtime),
                 profileID: profileID,
-                collectionContext: provenance
+                collectionContext: provenance,
+                startedAt: Date(),
+                progressSource: source.rawValue,
+                completionAccounts: completionAccounts
             )
             successCallback = URL(string: "nuvio-krystian://external-playback/\(id)")
             errorCallback = URL(string: "nuvio-krystian://external-playback/error/\(id)")

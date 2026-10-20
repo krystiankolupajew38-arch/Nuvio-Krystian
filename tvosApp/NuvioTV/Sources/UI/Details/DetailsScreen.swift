@@ -6583,7 +6583,7 @@ private struct TvEpisodeLookupIdentity: Equatable {
 
 /// Sorted once when the metadata episode list changes. Focus-driven Details
 /// updates reuse both the ordered guide and its per-season slices.
-private struct TvEpisodeGuide {
+struct TvEpisodeGuide {
     let metaID: String
     let revision: Int
     let episodes: [NuvioVideo]
@@ -6734,7 +6734,7 @@ enum TvDetailsPlayTargetBuilder {
     }
 }
 
-private struct TvDetailsEpisodeInitialState {
+struct TvDetailsEpisodeInitialState {
     let selectedSeason: Int
     let seasonEpisodes: [NuvioVideo]
     let seasonEpisodeIndexByID: [String: Int]
@@ -6745,7 +6745,7 @@ private struct TvDetailsEpisodeInitialState {
     let seasonIsWatched: Bool
 }
 
-private struct TvDetailsEpisodePresentation {
+struct TvDetailsEpisodePresentation {
     let guide: TvEpisodeGuide
     let continueItem: ContinueWatchingItem?
     let playTarget: TvDetailsPlayTarget
@@ -6753,14 +6753,14 @@ private struct TvDetailsEpisodePresentation {
     let revision: TvDetailsEpisodePresentationRevision
 }
 
-private struct TvDetailsEpisodePresentationRevision: Equatable {
+struct TvDetailsEpisodePresentationRevision: Equatable {
     let watched: Int
     let selection: Int
 }
 
 /// Builds episode-derived state synchronously on the first Details render and
 /// refreshes it only when episode metadata or watched/progress state changes.
-private final class TvDetailsEpisodeCache: ObservableObject {
+final class TvDetailsEpisodeCache: ObservableObject {
     private var input: TvEpisodeGuideInput?
     private var lookupIdentity: TvEpisodeLookupIdentity?
     private var progressRevision: Int?
