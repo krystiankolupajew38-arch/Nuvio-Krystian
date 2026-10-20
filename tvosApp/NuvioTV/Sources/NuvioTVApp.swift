@@ -684,6 +684,12 @@ struct ContentView: View {
         .onReceive(profileViewModel.$activeProfile.receive(on: RunLoop.main)) { profile in
             syncManager.activeProfileChanged(profile)
             guard profile != nil else { return }
+            // Profile-scoped stores may only finish installing on the next turn.
+            // Retry a previously captured callback after profile restoration.
+            Task { @MainActor in
+                await Task.yield()
+                recoverExternalPlaybackReturnIfPossible()
+            }
             SMBServerStore.shared.reload()
             JellyfinServerStore.shared.reload()
             Task(priority: .utility) {
@@ -1055,7 +1061,13 @@ struct ContentView: View {
     /// routing has finished. Preserve it through that gate, then consume it on
     /// the next main-actor turn after the active profile has been installed.
     private func resumePendingDeepLinkIfPossible() {
-        guard pendingDeepLinkURL != nil else { return }
+        if pendingDeepLinkURL == nil {
+            Task { @MainActor in
+                await Task.yield()
+                recoverExternalPlaybackReturnIfPossible()
+            }
+            return
+        }
         Task { @MainActor in
             await Task.yield()
             guard let url = pendingDeepLinkURL else { return }
