@@ -516,16 +516,16 @@ struct ExternalPlaybackSession: Codable, Equatable {
     /// percentage-only callback; that would manufacture a cross-device resume.
     func sample(for callback: ExternalPlaybackCallback) -> (position: Double, duration: Double)? {
         guard !callback.isError, callback.id == id,
-              !meta.isSeries || (season != nil && episode != nil),
-              let runtime = callback.duration ?? duration,
-              runtime.isFinite, runtime >= 60 else { return nil }
-        // Position is an absolute number of seconds, never a Trakt percentage.
-        // The caller stages it even if the saved runtime proves too short to be
-        // reliable; we must not silently clamp the episode to 100% watched.
-        let position = callback.position ?? callback.progress.map { $0 * runtime }
+              !meta.isSeries || (season != nil && episode != nil) else { return nil }
+        let runtime = callback.duration ?? duration
+        // Position is absolute seconds. A show-wide runtime estimate can be
+        // shorter than the actual episode; never discard a valid callback.
+        let position = callback.position ?? callback.progress.flatMap { fraction in
+            runtime.map { fraction * $0 }
+        }
         guard let position, position.isFinite,
-              position >= WatchProgressLedger.minimumTrackableSeconds,
-              position <= runtime else { return nil }
+              position >= WatchProgressLedger.minimumTrackableSeconds else { return nil }
+        guard let runtime, runtime.isFinite, runtime >= 60 else { return nil }
         return (position, runtime)
     }
 }
