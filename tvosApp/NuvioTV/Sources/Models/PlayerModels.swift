@@ -512,24 +512,25 @@ struct ExternalPlaybackSession: Codable, Equatable {
     /// interrupted profile selection or failed write cannot lose its position.
     var returnedCallback: ExternalPlaybackCallback? = nil
 
-    /// Infuse documents position in seconds. Never invent a runtime for a
-    /// percentage-only callback; that would manufacture a cross-device resume.
+    /// Infuse's returned position is absolute seconds. Like Nuvio Mobile,
+    /// persist it independently of duration. Zero duration means unknown,
+    /// not completed, and must never create a percentage or watched history.
+    /// A valid position beyond a stale runtime invalidates that runtime.
     func sample(for callback: ExternalPlaybackCallback) -> (position: Double, duration: Double)? {
         guard !callback.isError, callback.id == id,
               !meta.isSeries || (season != nil && episode != nil) else { return nil }
         let runtime = callback.duration ?? duration
-        // Position is absolute seconds. A show-wide runtime estimate can be
-        // shorter than the actual episode; never discard a valid callback.
         let position = callback.position ?? callback.progress.flatMap { fraction in
-            runtime.map { fraction * $0 }
+            guard let runtime, runtime.isFinite, runtime >= 60 else { return nil }
+            return fraction * runtime
         }
         guard let position, position.isFinite,
               position >= WatchProgressLedger.minimumTrackableSeconds else { return nil }
-        // A duration shorter than the callback position is untrustworthy.
-        // Keep the staged position; never fabricate a completed watch.
-        guard let runtime, runtime.isFinite, runtime >= 60,
-              position <= runtime else { return nil }
-        return (position, runtime)
+        let trustworthyDuration = runtime.flatMap { candidate -> Double? in
+            guard candidate.isFinite, candidate >= 60, candidate >= position else { return nil }
+            return candidate
+        }
+        return (position, trustworthyDuration ?? 0)
     }
 }
 
@@ -655,11 +656,8 @@ enum ExternalPlaybackReturnHandler {
            WeTrakrProgressService.completionAccountID(in: store, profileId: profileID) != account { return false }
         let threshold = source == .mdblist && remote
             ? MdbListProgressService.completionPercent / 100 : WatchProgressLedger.completionFraction
-        // Metadata runtime is only a guess, particularly for TV series. An
-        // Infuse callback has no duration field; without a previously measured
-        // episode duration, its exact seconds are retained for retry rather
-        // than guessed into a watched completion.
-        let completed = position / duration >= threshold
+        // A position-only callback has no trustworthy completion fraction.
+        let completed = duration >= 60 && position <= duration && position / duration >= threshold
 
         // A later local or pulled sample wins over a delayed external return.
         // Matching values allow retry after a partially successful disk write.
@@ -667,9 +665,9 @@ enum ExternalPlaybackReturnHandler {
             if !remote, let row = WatchProgressLedger.record(contentId: session.meta.id, season: session.season, episode: session.episode),
                row.lastWatchedAt > startedAt,
                row.position != position && !(completed && row.position == duration) { return false }
-            if remote, let row = TraktProgressService.currentContinueWatchingItem(for: session.meta),
-               row.season == session.season, row.episode == session.episode,
-               row.lastWatchedAt > startedAt, row.position != position { return false }
+            // A Trakt scrobble can arrive *during* this Infuse handoff and its
+            // approximate position may differ. It cannot invalidate the exact
+            // later callback merely because it has a newer pause timestamp.
             if let row = WatchedStore.items().first(where: {
                 WatchedStore.sameContent($0.meta, session.meta) && $0.season == session.season && $0.episode == session.episode
             }), row.watchedAt > startedAt,
@@ -687,7 +685,7 @@ enum ExternalPlaybackReturnHandler {
                 completionID: session.id, source: source, completionAccounts: session.completionAccounts
             ) else { return false }
             if session.externalPlayerName != ExternalPlayer.infuse.rawValue || source != .trakt {
-            Task { @MainActor in
+                Task { @MainActor in
                 _ = await TraktProgressService.finishPlaybackForHistory(
                     meta: session.meta, position: position, duration: duration,
                     season: session.season, episode: session.episode, store: store,
@@ -695,7 +693,7 @@ enum ExternalPlaybackReturnHandler {
                     expectedAccountID: session.completionAccounts?[source.rawValue],
                     traktMirrorAccountID: source == .trakt ? nil : session.completionAccounts?[TraktWatchProgressSource.trakt.rawValue]
                 )
-            }
+                }
             }
         } else if remote {
             guard TraktProgressService.recordLocalPlayback(
@@ -706,7 +704,7 @@ enum ExternalPlaybackReturnHandler {
             // Keep our immediate local checkpoint, but do not send a second
             // competing pause position from Nuvio for the same episode.
             if session.externalPlayerName != ExternalPlayer.infuse.rawValue || source != .trakt {
-            Task { @MainActor in
+                Task { @MainActor in
                 guard ProfileSettings.activeProfileID == profileID, ProfileSettings.isActiveStore(store) else { return }
                 _ = await TraktProgressService.reportPlayback(
                     meta: session.meta, position: position, duration: duration,
@@ -714,7 +712,7 @@ enum ExternalPlaybackReturnHandler {
                     store: store, sourceOverride: source,
                     expectedAccountID: session.completionAccounts?[source.rawValue], profileId: profileID
                 )
-            }
+                }
             }
         } else {
             guard ContinueWatchingStore.save(
