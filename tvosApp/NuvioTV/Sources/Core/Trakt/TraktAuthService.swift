@@ -1736,9 +1736,12 @@ struct TraktProgressService {
                     let localProgress = local.duration > 0 ? (local.position / local.duration) : 0
                     let remoteProgress = remote.duration > 0 ? (remote.position / remote.duration) : 0
                     let remoteIsSubstantiallyNewer = remote.lastWatchedAt > local.lastWatchedAt.addingTimeInterval(30)
-                    let remoteIsFurther = remoteProgress > (localProgress + 0.01)
-
-                    if remoteIsSubstantiallyNewer && remoteIsFurther {
+                    // Timestamp and episode identity determine whether this is
+                    // later playback, not the largest percentage. Rewinding or
+                    // restarting an episode on another device is legitimate.
+                    // Ignore remote snapshots whose timestamp is only marginally
+                    // ahead of a local callback (clock skew / delayed scrobble).
+                    if remoteIsSubstantiallyNewer {
                         // User genuinely continued playback on another device.
                         // Inherit verified stream duration if remote has an estimated duration.
                         let resolvedDuration = local.duration > 100 ? local.duration : remote.duration
