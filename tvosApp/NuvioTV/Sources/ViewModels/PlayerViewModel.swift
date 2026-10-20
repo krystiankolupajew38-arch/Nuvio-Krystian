@@ -405,6 +405,7 @@ class PlayerViewModel: ObservableObject {
     /// Watching so the Home hero can say which episode is in progress.
     private var activeEpisodeNumbers: (season: Int, episode: Int)?
     private var pendingResumeSeconds: Double?
+    private var pendingResumeFraction: Double?
     private var didApplyResume = false
     var pendingExternalSubtitles: [NuvioSubtitle] = []
     private var didAddExternalSubtitles = false
@@ -902,6 +903,7 @@ class PlayerViewModel: ObservableObject {
         httpHeaders: [String: String] = [:],
         externalSubtitles: [NuvioSubtitle] = [],
         resumeFrom: Double?,
+        resumeFraction: Double? = nil,
         playbackOrigin: PlaybackOrigin = .main,
         bingeGroup: String? = nil,
         addonName: String? = nil,
@@ -981,6 +983,11 @@ class PlayerViewModel: ObservableObject {
             currentEpisode: currentEpisode,
             beginsNewPlaybackCompletionSession: !hasLoaded
         )
+        if !isActionPlaybackSession && !isTrailerPlayback && (resumeFrom ?? 0) <= 0,
+           let fraction = resumeFraction, fraction.isFinite, fraction > 0, fraction < 0.9 {
+            pendingResumeSeconds = nil
+            pendingResumeFraction = fraction
+        }
         guard !hasLoaded else { return }
         hasLoaded = true
 
@@ -1217,8 +1224,9 @@ class PlayerViewModel: ObservableObject {
         if name.hasPrefix("now:") || name.hasPrefix("live:") || name.hasPrefix("[live]") || name.hasPrefix("(live)") {
             return true
         }
-        if let urlString = url?.absoluteString.lowercased() {
-            if urlString.contains("/live/") || urlString.contains("/iptv/") || urlString.contains("live.m3u8") {
+        // Only the resource path is a live hint. Hostnames, tokens and fragments are not.
+        if let path = url?.path.lowercased() {
+            if path.contains("/live/") || path.contains("/iptv/") || path.contains("live.m3u8") {
                 return true
             }
         }
@@ -1393,6 +1401,7 @@ class PlayerViewModel: ObservableObject {
         self.activeTrackSelectionKey = selectionKey
         self.pendingTrackSelection = effectiveSelection
         self.pendingResumeSeconds = isActionPlaybackSession || isLiveStream ? nil : resumeFrom
+        self.pendingResumeFraction = nil
         self.didApplyResume = false
         self.lastStablePlaybackTime = nil
         self.hasProducedMidFilePosition = false
@@ -2130,6 +2139,7 @@ class PlayerViewModel: ObservableObject {
         if let episode, episode.id != currentEpisodeVideo?.id {
             availableSources = []
         }
+        let resumeFraction = episode == nil && (resumeFrom ?? 0) <= 0 ? pendingResumeFraction : nil
         applyStreamState(
             url: prepared.url,
             meta: meta,
@@ -2140,6 +2150,8 @@ class PlayerViewModel: ObservableObject {
             currentEpisode: episode ?? currentEpisodeVideo,
             preserveSessionPreferences: true
         )
+        pendingResumeFraction = resumeFraction
+        if resumeFraction != nil { pendingResumeSeconds = nil }
         self.activeAddonName = prepared.addonName
         self.activeProviderName = prepared.provider
         self.activeFilename = prepared.filename
@@ -2716,19 +2728,8 @@ class PlayerViewModel: ObservableObject {
         )
 
         // Reuse this refresh; Party never starts its own engine polling loop.
-        if let bridge = watchPartyPlayerBridge, let stamp = watchPartyPlayerStamp() {
-            bridge.observe(WatchPartyPlayerSample(
-                stamp: stamp, positionMs: c.positionMs, durationMs: c.durationMs,
-                rate: c.currentSpeed, paused: !c.isTransportPlaying,
-                loading: !hasPresentedCurrentLoad || c.isPlayerLoading || isSwitchingSource
-                    || isReloadingStream || isFailingOver || isAwaitingStreamStart
-                    || isScrubbing || isHoldingSeek || pendingSeekDelta != 0,
-                coherent: c.hasCoherentTimeSample && c.currentErrorMessage.isEmpty
-                    && !c.isPlayerEnded && !isLiveStream,
-                seeking: sampledEngineKind == .mpv && playerController.isSeekingForWatchParty,
-                rendered: hasPresentedCurrentLoad && hasRenderedFirstFrame,
-                failed: !c.currentErrorMessage.isEmpty || sessionCoordinator.lastLoadError != nil
-            ))
+        if let bridge = watchPartyPlayerBridge, let sample = watchPartySampleForCurrentState() {
+            bridge.observe(sample)
             // A binding's synchronous callback can invalidate or replace the source.
             guard activeEngineKind == sampledEngineKind,
                   sessionCoordinator.loadGeneration == sampledLoadGeneration,
@@ -2796,21 +2797,17 @@ class PlayerViewModel: ObservableObject {
         let rawDuration = Double(c.durationMs) / 1000.0
         let latestTime = PlayerTime(current: rawCurrent, duration: rawDuration)
 
-        // Dynamically detect live streams (streams without finite duration when active frames are decoding).
-        if !isLiveStream,
-           c.isPlayerPlaying,
-           !c.isPlayerLoading,
-           !c.isPlayerEnded,
-           !isAwaitingStreamStart,
-           c.durationMs <= 0,
-           time.duration <= 0 {
-            isLiveStream = true
-        } else if isLiveStream,
-                  let activeMeta,
-                  !Self.isLiveStream(meta: activeMeta, url: activeStreamURL.flatMap(URL.init(string:))),
-                  c.durationMs > 0,
-                  c.hasCoherentTimeSample {
-            isLiveStream = false
+        // An unavailable duration is unknown, not evidence of a live stream.
+        // Keep recognized channel/source hints, including a URL resolved after load.
+        if let activeMeta {
+            let sourceIsLive = Self.isLiveStream(
+                meta: activeMeta, url: activeStreamURL.flatMap(URL.init(string:))
+            )
+            if sourceIsLive {
+                if !isLiveStream { isLiveStream = true }
+            } else if isLiveStream, c.durationMs > 0, c.hasCoherentTimeSample {
+                isLiveStream = false
+            }
         }
 
         let isPreSeekSettlingSample: Bool = {
@@ -3570,6 +3567,29 @@ class PlayerViewModel: ObservableObject {
         PictureInPictureManager.shared.refreshController(for: sessionCoordinator)
     }
 
+    /// Read current engine properties and UI admission flags without starting another
+    /// poll or issuing playback commands. The binding validates the exact stamp.
+    private func watchPartySampleForCurrentState() -> WatchPartyPlayerSample? {
+        guard !didShutdown, let stamp = watchPartyPlayerStamp() else { return nil }
+        let controller = engine
+        let kind = activeEngineKind
+        let presented = currentLoadPresentationIsConfirmed(
+            engineKind: kind, generation: sessionCoordinator.loadGeneration
+        )
+        return WatchPartyPlayerSample(
+            stamp: stamp, positionMs: controller.positionMs, durationMs: controller.durationMs,
+            rate: controller.currentSpeed, paused: !controller.isTransportPlaying,
+            loading: !presented || controller.isPlayerLoading || isSwitchingSource
+                || isReloadingStream || isFailingOver || isAwaitingStreamStart
+                || isScrubbing || isHoldingSeek || pendingSeekDelta != 0,
+            coherent: controller.hasCoherentTimeSample && controller.currentErrorMessage.isEmpty
+                && !controller.isPlayerEnded && !isLiveStream,
+            seeking: kind == .mpv && playerController.isSeekingForWatchParty,
+            rendered: presented && hasRenderedFirstFrame,
+            failed: !controller.currentErrorMessage.isEmpty || sessionCoordinator.lastLoadError != nil
+        )
+    }
+
     func attachWatchPartyControls(binding: WatchPartyPlaybackBinding,
                                   isCurrent: @escaping @MainActor () -> Bool) throws {
         guard watchPartyPlayerBridge != nil, watchPartyControls == nil else {
@@ -3577,9 +3597,10 @@ class PlayerViewModel: ObservableObject {
         }
         watchPartyControls = WatchPartyControlRouter(isCurrent: isCurrent,
             currentStamp: { [weak self] in self?.watchPartyPlayerStamp() },
-            canonicalRate: { [weak binding] in binding?.canonicalRate }, perform: { [weak binding] intent, applied in
+            canonicalRate: { [weak binding] in binding?.canonicalRate }, perform: { [weak self, weak binding] intent, applied in
             guard let binding else { throw WatchPartyPlaybackBindingError.notReady }
-            try await binding.perform(intent, onApplied: applied)
+            try await binding.perform(intent, onApplied: applied,
+                refreshSample: { [weak self] in self?.watchPartySampleForCurrentState() })
         }, suspend: { [weak binding] in binding?.setSuspended($0) }, onError: { [weak self] error in
             self?.showPlayerToast((error as? WatchPartyPlaybackBindingError) == .busy
                 ? "Watch Party is synchronizing" : "Watch Party control unavailable")
@@ -6411,18 +6432,17 @@ class PlayerViewModel: ObservableObject {
         // The accepted room timeline owns Party startup; local history is not a user seek.
         guard watchPartyPlayerBridge == nil else { return }
         let minResumeThreshold = isTrailerPlaybackSession ? 0.5 : 5.0
-        guard !didApplyResume,
-              let pendingResumeSeconds,
-              pendingResumeSeconds > minResumeThreshold,
-              time.duration > 0 else {
-            return
-        }
+        guard !didApplyResume, time.duration > 0 else { return }
         guard !loadedStreamLooksLikeReplacement() else { return }
-
+        let targetSeconds = pendingResumeSeconds
+            ?? pendingResumeFraction.map { time.duration * $0 }
+        guard let targetSeconds, targetSeconds.isFinite,
+              targetSeconds > minResumeThreshold else { return }
         didApplyResume = true
+        pendingResumeFraction = nil
         let target = isTrailerPlaybackSession
-            ? min(pendingResumeSeconds, max(time.duration - 1, 0))
-            : min(pendingResumeSeconds, max(time.duration - 5, 0))
+            ? min(targetSeconds, max(time.duration - 1, 0))
+            : min(targetSeconds, max(time.duration - 5, 0))
         seek(to: target)
     }
 

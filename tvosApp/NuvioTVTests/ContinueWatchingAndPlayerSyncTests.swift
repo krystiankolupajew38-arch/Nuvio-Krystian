@@ -3208,3 +3208,103 @@ final class NuvioSyncProfileSettingsTests: XCTestCase {
         XCTAssertEqual(totalUploadCount, firstUploadCount)
     }
 }
+
+extension ContinueWatchingAndPlayerSyncTests {
+    @MainActor
+    func testExternalCompletionAndPartialProgressStayOnExactEpisode() {
+        let suite = "external-episode-integration"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let meta = NuvioMeta(id: "external-isolation-fixture", name: "Fixture", type: "series")
+        for (season, episode, fraction) in [(1, 3, 1.0), (1, 8, 0.95), (2, 2, 0.45)] {
+            let session = ExternalPlaybackSession(id: "episode-\(season)-\(episode)", meta: meta,
+                sourceURL: "https://example.invalid/episode", season: season, episode: episode,
+                duration: 2000, profileID: ProfileSettings.activeProfileID, startedAt: Date(),
+                progressSource: TraktWatchProgressSource.nuvioSync.rawValue, completionAccounts: [:])
+            ExternalPlaybackSessionStore.save(session, defaults: defaults)
+            XCTAssertTrue(ExternalPlaybackReturnHandler.handle(
+                ExternalPlaybackCallback(id: session.id, isError: false, progress: fraction, position: nil),
+                profileID: session.profileID, defaults: defaults))
+        }
+        XCTAssertEqual(WatchedStore.watchedEpisodeKeys(meta: meta), ["1:3", "1:8"])
+        XCTAssertEqual(ContinueWatchingStore.resumePosition(for: meta, season: 2, episode: 2), 900)
+        XCTAssertNil(ContinueWatchingStore.resumePosition(for: meta, season: 2, episode: 3))
+        XCTAssertNil(WatchProgressLedger.record(contentId: meta.id, season: 1, episode: 4))
+        let local = WatchProgressLedger.record(contentId: meta.id, season: 2, episode: 2)!
+        var older = local
+        older = WatchProgressRecord(progressKey: local.progressKey, contentId: meta.id, contentType: "series",
+            videoId: local.videoId, season: 2, episode: 2, position: 100, duration: 2000,
+            lastWatchedAt: local.lastWatchedAt.addingTimeInterval(-60))
+        XCTAssertTrue(WatchProgressLedger.mergeRemote([older]))
+        XCTAssertEqual(WatchProgressLedger.record(forKey: local.progressKey)?.position, 900)
+        WatchedStore.setActiveProfile(nil)
+        WatchedStore.setActiveProfile(ProfileSettings.activeProfileID)
+        XCTAssertEqual(WatchedStore.watchedEpisodeKeys(meta: meta), ["1:3", "1:8"])
+    }
+
+    @MainActor
+    func testDelayedExternalCallbackCannotOverwriteNewerProgress() {
+        let suite = "external-delayed-integration"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let meta = NuvioMeta(id: "external-delay-fixture", name: "Fixture", type: "series")
+        let session = ExternalPlaybackSession(id: "delayed", meta: meta,
+            sourceURL: "https://example.invalid/episode", season: 1, episode: 3, duration: 2000,
+            profileID: ProfileSettings.activeProfileID, startedAt: Date(timeIntervalSince1970: 1),
+            progressSource: TraktWatchProgressSource.nuvioSync.rawValue)
+        ExternalPlaybackSessionStore.save(session, defaults: defaults)
+        XCTAssertTrue(ContinueWatchingStore.save(meta: meta, streamUrl: session.sourceURL,
+            position: 1200, duration: 2000, season: 1, episode: 3))
+        XCTAssertFalse(ExternalPlaybackReturnHandler.handle(
+            ExternalPlaybackCallback(id: session.id, isError: false, progress: 0.45, position: nil),
+            profileID: session.profileID, defaults: defaults))
+        XCTAssertEqual(ContinueWatchingStore.resumePosition(for: meta, season: 1, episode: 3), 1200)
+        XCTAssertNil(ExternalPlaybackSessionStore.load(defaults: defaults), "Superseded callbacks must not block future handoffs")
+    }
+}
+
+extension ContinueWatchingAndPlayerSyncTests {
+    @MainActor
+    func testExternalProviderCheckpointInvalidatesImmediatelyWithoutNuvioLedgerWrite() {
+        let meta = NuvioMeta(id: "external-provider-fixture", name: "Fixture", type: "series")
+        for source in [TraktWatchProgressSource.trakt, .mdblist] {
+            let notification = expectation(forNotification: TraktSettingsStore.continueWatchingChangedNotification, object: nil)
+            XCTAssertTrue(TraktProgressService.recordLocalPlayback(meta: meta, position: 900, duration: 2000,
+                season: 2, episode: 2, source: source, notify: true))
+            let item = TraktProgressService.currentContinueWatchingItem(for: meta, source: source)
+            XCTAssertEqual(item?.position, 900)
+            XCTAssertEqual(item?.season, 2)
+            XCTAssertEqual(item?.episode, 2)
+            XCTAssertNil(WatchProgressLedger.record(contentId: meta.id, season: 2, episode: 2))
+            wait(for: [notification], timeout: 1)
+        }
+        // Checkpoints are scoped separately from the Nuvio ledger.
+        for source in [TraktWatchProgressSource.trakt, .mdblist] {
+            ProfileSettings.current.set(source.rawValue, forKey: SettingsKey.traktWatchProgressSource)
+            TraktProgressService.forgetLocalPlayback(meta: meta, season: 2, episode: 2)
+        }
+    }
+}
+
+extension ContinueWatchingAndPlayerSyncTests {
+    @MainActor
+    func testExternalProgressInvalidatesPresentationWithoutResettingEpisodeSelectionRevision() {
+        let meta = NuvioMeta(id: "external-focus-fixture", name: "Fixture", type: "series", videos: [
+            NuvioVideo(id: "external-focus-fixture:1:3", title: "Three", season: 1, episode: 3),
+            NuvioVideo(id: "external-focus-fixture:2:2", title: "Two", season: 2, episode: 2)
+        ])
+        let cache = TvDetailsEpisodeCache()
+        let first = cache.resolve(meta: meta, progressRevision: 0, continueItemProvider: { nil },
+                                  playTargetBuilder: TvDetailsPlayTargetBuilder.makePlayTarget)
+        let item = ContinueWatchingItem(meta: meta, streamUrl: "", position: 900, duration: 2000,
+                                       lastWatchedAt: Date(timeIntervalSince1970: 1), season: 2, episode: 2)
+        let updated = cache.resolve(meta: meta, progressRevision: 1, continueItemProvider: { item },
+                                    playTargetBuilder: TvDetailsPlayTargetBuilder.makePlayTarget)
+        XCTAssertEqual(updated.continueItem?.progress, 0.45)
+        XCTAssertGreaterThan(updated.revision.watched, first.revision.watched)
+        // TvDetailsEpisodes resets season/scroll only when selection changes;
+        // a progress-only publication therefore leaves its @State and focus intact.
+        XCTAssertEqual(updated.revision.selection, first.revision.selection)
+        XCTAssertEqual(updated.guide.revision, first.guide.revision)
+    }
+}

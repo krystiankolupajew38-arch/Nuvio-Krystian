@@ -24,12 +24,17 @@ enum TmdbMetadataLanguage {
         let appLanguage = AppLanguage.fromStored(raw)
         guard appLanguage == .system else { return normalized(appLanguage.tag) }
         // Only use the device language when Nuvio itself is set to System.
-        let exact = AppLanguage.fromStored(systemLanguage)
+        // TMDB accepts regional BCP-47 codes independently of the app's UI
+        // language list. Do not collapse the device's en-GB to generic en.
+        let deviceTag = normalized(systemLanguage)
+        // Existing automatic choices continue to use the app-supported base
+        // language, with the explicit regional English TMDB variants retained.
+        if deviceTag == "en-GB" || deviceTag == "en-US" { return deviceTag }
+        let exact = AppLanguage.fromStored(deviceTag)
         if exact != .system { return normalized(exact.tag) }
-        let base = systemLanguage.replacingOccurrences(of: "_", with: "-")
-            .split(separator: "-").first.map(String.init) ?? "en"
+        let base = deviceTag.split(separator: "-").first.map(String.init) ?? "en"
         let supported = AppLanguage.fromStored(base)
-        return normalized(supported == .system ? "en" : supported.tag)
+        return supported == .system ? "en" : normalized(supported.tag)
     }
 
     static func selectAutomatic(in store: UserDefaults) {

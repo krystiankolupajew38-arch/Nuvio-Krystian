@@ -26,6 +26,7 @@ struct PlayerView: View {
     let httpHeaders: [String: String]
     let externalSubtitles: [NuvioSubtitle]
     let resumeFrom: Double?
+    var resumeFraction: Double? = nil
     var isActionPlaybackSession: Bool = false
     var playbackOrigin: PlaybackOrigin = .main
     var bingeGroup: String? = nil
@@ -83,6 +84,7 @@ struct PlayerView: View {
         httpHeaders: [String: String],
         externalSubtitles: [NuvioSubtitle],
         resumeFrom: Double?,
+        resumeFraction: Double? = nil,
         isActionPlaybackSession: Bool = false,
         playbackOrigin: PlaybackOrigin = .main,
         bingeGroup: String? = nil,
@@ -128,6 +130,7 @@ struct PlayerView: View {
         self.httpHeaders = httpHeaders
         self.externalSubtitles = externalSubtitles
         self.resumeFrom = resumeFrom
+        self.resumeFraction = resumeFraction
         self.isActionPlaybackSession = isActionPlaybackSession
         self.playbackOrigin = playbackOrigin
         self.bingeGroup = bingeGroup

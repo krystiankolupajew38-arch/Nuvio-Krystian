@@ -237,7 +237,7 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
             if let encodedFilename, !encodedFilename.isEmpty {
                 query += "&filename=\(encodedFilename)"
             }
-            if let position, position > 0 {
+            if let position, position.isFinite, position >= 0 {
                 query += "&position=\(Int(position))"
             }
             for sub in encodedSubs.prefix(8) {
@@ -451,11 +451,14 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
 }
 
 /// The callback returned by Infuse after an external playback handoff.
-struct ExternalPlaybackCallback: Equatable {
+struct ExternalPlaybackCallback: Equatable, Codable {
     let id: String
     let isError: Bool
     let progress: Double?
     let position: Double?
+    var duration: Double? = nil
+    /// Infuse supplies the played URL with a successful x-callback.
+    var lastPlayedURL: String? = nil
 
     static func parse(_ url: URL) -> ExternalPlaybackCallback? {
         guard url.scheme?.lowercased() == "nuvio-krystian",
@@ -463,7 +466,7 @@ struct ExternalPlaybackCallback: Equatable {
         let parts = url.path.split(separator: "/").map(String.init)
         let isError = parts.first?.lowercased() == "error"
         let id = isError ? parts.dropFirst().first : parts.first
-        guard let id, !id.isEmpty else { return nil }
+        guard let id, !id.isEmpty, parts.count == (isError ? 2 : 1) else { return nil }
         let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         func number(_ name: String) -> Double? {
             guard let raw = query.first(where: { $0.name == name })?.value,
@@ -471,7 +474,7 @@ struct ExternalPlaybackCallback: Equatable {
             return value
         }
         let progress: Double?
-        if let value = number("progress") {
+        if !isError, let value = number("progress") {
             guard (0...1).contains(value) else { return nil }
             progress = value
         } else {
@@ -481,7 +484,9 @@ struct ExternalPlaybackCallback: Equatable {
             id: id,
             isError: isError,
             progress: progress,
-            position: number("position")
+            position: number("position"),
+            duration: number("duration"),
+            lastPlayedURL: query.first(where: { $0.name == "lastPlayedUrl" })?.value
         )
     }
 }
@@ -498,12 +503,50 @@ struct ExternalPlaybackSession: Codable, Equatable {
     let duration: Double?
     let profileID: String?
     var collectionContext: CollectionPlaybackContext? = nil
+    var startedAt: Date? = nil
+    var progressSource: String? = nil
+    var completionAccounts: [String: String]? = nil
+    /// Source player identity; optional for previously saved in-flight sessions.
+    var externalPlayerName: String? = nil
+    /// An acknowledged callback is saved before updating playback stores, so an
+    /// interrupted profile selection or failed write cannot lose its position.
+    var returnedCallback: ExternalPlaybackCallback? = nil
+    var returnedAt: Date? = nil
+
+    /// Infuse's returned position is absolute seconds. Like Nuvio Mobile,
+    /// persist it independently of duration. Zero duration means unknown,
+    /// not completed, and must never create a percentage or watched history.
+    /// A valid position beyond a stale runtime invalidates that runtime.
+    func sample(for callback: ExternalPlaybackCallback) -> (position: Double, duration: Double)? {
+        guard !callback.isError, callback.id == id,
+              !meta.isSeries || (season != nil && episode != nil) else { return nil }
+        // Legacy ledger durations have no measured/estimated provenance. Infuse
+        // seconds alone cannot prove completion against those historical runtimes.
+        let runtime = callback.duration ?? (externalPlayerName == ExternalPlayer.infuse.rawValue ? nil : duration)
+        let position = callback.position ?? callback.progress.flatMap { fraction in
+            guard let runtime, runtime.isFinite, runtime >= 60 else { return nil }
+            return fraction * runtime
+        }
+        guard let position, position.isFinite,
+              position >= WatchProgressLedger.minimumTrackableSeconds else { return nil }
+        let trustworthyDuration = runtime.flatMap { candidate -> Double? in
+            guard candidate.isFinite, candidate >= 60, candidate >= position else { return nil }
+            return candidate
+        }
+        return (position, trustworthyDuration ?? 0)
+    }
 }
 
 enum ExternalPlaybackSessionStore {
     private static let key = "nuvio.tv.externalPlaybackSession.v1"
 
-    static func save(_ session: ExternalPlaybackSession, defaults: UserDefaults = .standard) {
+    private static let directory = "ExternalPlaybackSession"
+
+    @discardableResult
+    static func save(_ session: ExternalPlaybackSession, defaults: UserDefaults = .standard) -> Bool {
+        // Do not lose a captured return when another profile starts playback.
+        if let pending = load(defaults: defaults), pending.returnedCallback != nil,
+           pending.id != session.id { return false }
         // A series meta can carry its entire episode guide. This handoff is a
         // single-slot preference, so persist the compact form and never send a
         // full guide to cfprefsd.
@@ -515,14 +558,89 @@ enum ExternalPlaybackSessionStore {
             episode: session.episode,
             duration: session.duration,
             profileID: session.profileID,
-            collectionContext: session.collectionContext
+            collectionContext: session.collectionContext,
+            startedAt: session.startedAt,
+            progressSource: session.progressSource,
+            completionAccounts: session.completionAccounts,
+            externalPlayerName: session.externalPlayerName,
+            returnedCallback: session.returnedCallback,
+            returnedAt: session.returnedAt
         )
-        guard let data = try? JSONEncoder().encode(compactSession) else { return }
-        defaults.set(data, forKey: key)
+        guard let data = try? JSONEncoder().encode(compactSession) else { return false }
+        if defaults === UserDefaults.standard {
+            // UserDefaults readback only confirms its memory cache. Commit an
+            // atomic file before acknowledging a return or opening the player.
+            guard LargePayloadStore.write(data, key: key, directory: directory),
+                  LargePayloadStore.read(key: key, directory: directory) == data else { return false }
+            defaults.removeObject(forKey: key)
+        } else {
+            // Isolated preference suites are used by transaction unit tests.
+            defaults.set(data, forKey: key)
+        }
+        return true
+    }
+
+    /// Compare URL representations without decoding reserved delimiters, sorting
+    /// query parameters, or dropping credentials: those can identify different files.
+    static func sameSourceURL(_ lhs: String, _ rhs: String) -> Bool {
+        func normalized(_ value: String) -> String? {
+            guard var url = URLComponents(string: value), let scheme = url.scheme,
+                  let host = url.host, !host.isEmpty else { return nil }
+            url.scheme = scheme.lowercased()
+            url.host = host.lowercased()
+            if (url.scheme == "https" && url.port == 443) || (url.scheme == "http" && url.port == 80) {
+                url.port = nil
+            }
+            guard let text = url.string else { return nil }
+            let bytes = Array(text.utf8)
+            let unreserved = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~".utf8)
+            var result = ""
+            var index = 0
+            while index < bytes.count {
+                if bytes[index] == 37, index + 2 < bytes.count,
+                   let byte = UInt8(String(decoding: bytes[(index + 1)...(index + 2)], as: UTF8.self), radix: 16) {
+                    result += unreserved.contains(byte) ? String(UnicodeScalar(byte)) : String(format: "%%%02X", byte)
+                    index += 3
+                } else {
+                    result += String(UnicodeScalar(bytes[index]))
+                    index += 1
+                }
+            }
+            return result
+        }
+        guard let left = normalized(lhs), let right = normalized(rhs) else { return false }
+        return left == right
+    }
+
+    /// Durable capture occurs as soon as iOS delivers the URL, even if the
+    /// profile gate is still showing. The callback is accepted only for the
+    /// current handoff and (for Infuse) the exact URL originally handed off.
+    @discardableResult
+    static func stage(_ callback: ExternalPlaybackCallback, defaults: UserDefaults = .standard) -> Bool {
+        guard var session = load(defaults: defaults),
+              session.id == callback.id,
+              session.returnedCallback == nil || session.returnedCallback == callback else { return false }
+        if session.externalPlayerName == ExternalPlayer.infuse.rawValue, !callback.isError {
+            guard let playedURL = callback.lastPlayedURL,
+                  sameSourceURL(playedURL, session.sourceURL),
+                  callback.position != nil else { return false }
+        }
+        guard callback.isError || (
+            callback.position.map { $0.isFinite && $0 >= WatchProgressLedger.minimumTrackableSeconds } == true
+            || callback.progress.map { $0.isFinite && $0 > 0 } == true
+        ) else { return false }
+        session.returnedCallback = callback
+        session.returnedAt = session.returnedAt ?? Date()
+        guard save(session, defaults: defaults) else { return false }
+        // Confirm the durable write before treating the callback as captured.
+        return load(defaults: defaults)?.returnedCallback == callback
     }
 
     static func load(defaults: UserDefaults = .standard) -> ExternalPlaybackSession? {
-        guard let data = defaults.data(forKey: key) else { return nil }
+        let data = defaults === UserDefaults.standard
+            ? LargePayloadStore.read(key: key, directory: directory) ?? defaults.data(forKey: key)
+            : defaults.data(forKey: key)
+        guard let data else { return nil }
         return try? JSONDecoder().decode(ExternalPlaybackSession.self, from: data)
     }
 
@@ -536,8 +654,147 @@ enum ExternalPlaybackSessionStore {
         guard let session = load(defaults: defaults),
               session.id == id,
               session.profileID == profileID else { return nil }
+        if defaults === UserDefaults.standard {
+            LargePayloadStore.remove(key: key, directory: directory)
+        }
         defaults.removeObject(forKey: key)
         return session
+    }
+}
+
+/// Main-actor transaction: validate, persist, acknowledge, then sync. No await
+/// may occur before acknowledgement, so a profile switch cannot split writes.
+@MainActor
+enum ExternalPlaybackReturnHandler {
+    private enum PersistenceResult { case saved, retry, superseded }
+
+    @discardableResult
+    static func handle(
+        _ callback: ExternalPlaybackCallback,
+        profileID: String?,
+        defaults: UserDefaults = .standard,
+        persist: ((ExternalPlaybackSession, Double, Double) -> Bool)? = nil
+    ) -> Bool {
+        guard let stored = ExternalPlaybackSessionStore.load(defaults: defaults),
+              stored.id == callback.id, stored.profileID == profileID,
+              ExternalPlaybackSessionStore.stage(callback, defaults: defaults),
+              let session = ExternalPlaybackSessionStore.load(defaults: defaults) else { return false }
+        if callback.isError {
+            _ = ExternalPlaybackSessionStore.consume(id: session.id, profileID: session.profileID, defaults: defaults)
+            return false
+        }
+        guard let sample = session.sample(for: callback) else { return false }
+        let result = persist.map { $0(session, sample.position, sample.duration) ? PersistenceResult.saved : .retry }
+            ?? persistPlayback(session, position: sample.position, duration: sample.duration)
+        guard result != .retry else { return false }
+        _ = ExternalPlaybackSessionStore.consume(id: session.id, profileID: session.profileID, defaults: defaults)
+        return result == .saved
+    }
+
+    /// Replay a captured result after relaunch or when the correct profile
+    /// becomes active. Nothing is invented if Infuse did not send a callback.
+    @discardableResult
+    static func recover(profileID: String?, defaults: UserDefaults = .standard) -> Bool {
+        guard let session = ExternalPlaybackSessionStore.load(defaults: defaults),
+              session.profileID == profileID,
+              let callback = session.returnedCallback else { return false }
+        return handle(callback, profileID: profileID, defaults: defaults)
+    }
+
+    private static func persistPlayback(_ session: ExternalPlaybackSession, position: Double, duration: Double) -> PersistenceResult {
+        let profileID = session.profileID
+        guard ProfileSettings.activeProfileID == profileID,
+              WatchedStore.activeProfileId == profileID,
+              ContinueWatchingStore.activeProfileId == profileID,
+              WatchProgressLedger.activeProfileId == profileID else { return .retry }
+        let store = ProfileSettings.store(for: profileID)
+        let source = TraktSettingsStore.watchProgressSource(in: store)
+        guard session.progressSource == nil || session.progressSource == source.rawValue else { return .retry }
+        let remote = source != .nuvioSync
+        guard !remote || RemoteTrackingState.isProgressSourceAuthenticated(in: store) else { return .retry }
+        if source == .trakt, let account = session.completionAccounts?[TraktWatchProgressSource.trakt.rawValue],
+           TraktHistoryService.completionAccountID(in: store, profileId: profileID) != account { return .retry }
+        if source == .wetrakr, let account = session.completionAccounts?[TraktWatchProgressSource.wetrakr.rawValue],
+           WeTrakrProgressService.completionAccountID(in: store, profileId: profileID) != account { return .retry }
+        let threshold = source == .mdblist && remote
+            ? MdbListProgressService.completionPercent / 100 : WatchProgressLedger.completionFraction
+        // A position-only callback has no trustworthy completion fraction.
+        let completed = duration >= 60 && position <= duration && position / duration >= threshold
+
+        // A later local or pulled sample wins over a delayed external return.
+        // Matching values allow retry after a partially successful disk write.
+        if let startedAt = session.startedAt {
+            if !remote, let row = WatchProgressLedger.record(contentId: session.meta.id, season: session.season, episode: session.episode),
+               row.lastWatchedAt > startedAt,
+               row.position != position && !(completed && row.position == duration) { return .superseded }
+            if source == .trakt, let row = TraktProgressService.currentContinueWatchingItem(for: session.meta),
+               row.season == session.season, row.episode == session.episode,
+               row.position > 0, row.lastWatchedAt > startedAt, row.position != position {
+                return .superseded
+            }
+            // A Trakt scrobble can arrive *during* this Infuse handoff and its
+            // approximate position may differ. It cannot invalidate the exact
+            // later callback merely because it has a newer pause timestamp.
+            if let row = WatchedStore.items().first(where: {
+                WatchedStore.sameContent($0.meta, session.meta) && $0.season == session.season && $0.episode == session.episode
+            }), row.watchedAt > startedAt,
+               row.lastCountedPlaybackIDsBySource[source.rawValue] != session.id { return .superseded }
+        }
+
+        if completed {
+            if !remote {
+                guard ContinueWatchingStore.markPlaybackCompleted(
+                    meta: session.meta, duration: duration, season: session.season, episode: session.episode
+                ) else { return .retry }
+            }
+            guard WatchedStore.recordPlaybackCompletion(
+                session.meta, season: session.season, episode: session.episode,
+                completionID: session.id, source: source, completionAccounts: session.completionAccounts,
+                externallyReportedProviders: session.externalPlayerName == ExternalPlayer.infuse.rawValue ? [.trakt] : []
+            ) else { return .retry }
+            if session.externalPlayerName != ExternalPlayer.infuse.rawValue || source != .trakt {
+                Task { @MainActor in
+                    _ = await TraktProgressService.finishPlaybackForHistory(
+                        meta: session.meta, position: position, duration: duration,
+                        season: session.season, episode: session.episode, store: store,
+                        profileId: profileID, completionID: session.id, source: source,
+                        expectedAccountID: session.completionAccounts?[source.rawValue],
+                        traktMirrorAccountID: source == .trakt || session.externalPlayerName == ExternalPlayer.infuse.rawValue ? nil : session.completionAccounts?[TraktWatchProgressSource.trakt.rawValue]
+                    )
+                }
+            }
+        } else if remote {
+            guard TraktProgressService.recordLocalPlayback(
+                meta: session.meta, position: position, duration: duration,
+                season: session.season, episode: session.episode, source: source, notify: true,
+                preservesExactPosition: session.externalPlayerName == ExternalPlayer.infuse.rawValue,
+                recordedAt: session.returnedAt ?? Date()
+            ) else { return .retry }
+            // Infuse scrobbles to the user's Trakt account independently.
+            // Keep our immediate local checkpoint, but do not send a second
+            // competing pause position from Nuvio for the same episode.
+            if duration > 0 && (session.externalPlayerName != ExternalPlayer.infuse.rawValue || source != .trakt) {
+                Task { @MainActor in
+                    guard ProfileSettings.activeProfileID == profileID, ProfileSettings.isActiveStore(store) else { return }
+                    _ = await TraktProgressService.reportPlayback(
+                        meta: session.meta, position: position, duration: duration,
+                        season: session.season, episode: session.episode, action: .pause,
+                        store: store, sourceOverride: source,
+                        expectedAccountID: session.completionAccounts?[source.rawValue], profileId: profileID
+                    )
+                }
+            }
+        } else {
+            guard ContinueWatchingStore.save(
+                meta: session.meta, streamUrl: session.sourceURL, position: position,
+                duration: duration, season: session.season, episode: session.episode, requireVerifiedWrite: true
+            ) else { return .retry }
+            ContinueWatchingDismissStore.clear(contentId: session.meta.id)
+        }
+        if let context = session.collectionContext {
+            CollectionPlaybackOriginStore.recordStarted(meta: session.meta, context: context, activeProfileID: profileID)
+        }
+        return .saved
     }
 }
 

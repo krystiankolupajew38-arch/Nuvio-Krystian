@@ -56,6 +56,7 @@ extension PlayerView {
                     httpHeaders: httpHeaders,
                     externalSubtitles: externalSubtitles,
                     resumeFrom: resumeFrom,
+                    resumeFraction: resumeFraction,
                     playbackOrigin: playbackOrigin,
                     bingeGroup: bingeGroup ?? cachedBinge?.bingeGroup,
                     addonName: addonName ?? cachedBinge?.addonName,

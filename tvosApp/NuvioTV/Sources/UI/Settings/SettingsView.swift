@@ -184,6 +184,7 @@ enum SettingsKey {
     static let hideUnreleased = "nuvio.tv.settings.layout.hideUnreleased"
     static let showFullDates = "nuvio.tv.settings.layout.showFullDates"
     static let detailsActionsBelowInfo = "nuvio.tv.settings.layout.detailsActionsBelowInfo"
+    static let blurUnwatchedEpisodes = "nuvio.tv.settings.details.blurUnwatchedEpisodes"
 
     static let traktConnected = "nuvio.tv.settings.integrations.traktConnected"
     static let traktClientID = "nuvio.tv.settings.integrations.traktClientID"
@@ -327,6 +328,7 @@ enum SettingsKey {
     static let fastNavigation = "nuvio.tv.settings.advanced.fastNavigation"
     static let smoothFocus = "nuvio.tv.settings.advanced.smoothFocus"
     static let playbackDiagnostics = "nuvio.tv.settings.advanced.playbackDiagnostics"
+    static let releaseDateDiagnostics = "nuvio.tv.settings.advanced.releaseDateDiagnostics"
     static let playbackDebug = "nuvio.tv.settings.advanced.playbackDebug"
     static let focusHighlighter = "nuvio.tv.settings.advanced.focusHighlighter"
     static let iCloudSyncEnabled = "nuvio.tv.settings.advanced.iCloudSyncEnabled"
@@ -340,7 +342,7 @@ enum SettingsKey {
     /// and never enter the account settings payload.
     static let deviceLocal = Set([
         traktConnected, traktClientID, traktClientSecret, simklClientID, wetrakrClientID, wetrakrClientSecret, wetrakrConnected, aiSubtitlesGeminiAPIKey,
-        p2pConsentAccepted, iCloudSyncEnabled, iCloudLastSyncDate, tmdbFollowAppLanguage
+        p2pConsentAccepted, iCloudSyncEnabled, iCloudLastSyncDate, tmdbFollowAppLanguage, releaseDateDiagnostics
     ])
 
     static let all = [
@@ -351,7 +353,7 @@ enum SettingsKey {
         searchStyle, preferAddonArtworkInSearch,
         continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp,
         cardCornerRadius, cardSize, liquidGlassCards,
-        hideUnreleased, showFullDates, detailsActionsBelowInfo,
+        hideUnreleased, showFullDates, detailsActionsBelowInfo, blurUnwatchedEpisodes,
         traktConnected, traktClientID, traktClientSecret,
         traktContinueWatchingDaysCap, traktShowMetaComments,
         traktWatchProgressSource, watchProgressSourceChosenByUser,
@@ -388,7 +390,7 @@ enum SettingsKey {
         playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, seekPreviewEnabled, showLoadingStatus,
         audioDelayPersistEnabled, persistentAudioDelayMs,
         sceneFeatureEnabled,
-        fastNavigation, smoothFocus, playbackDiagnostics, playbackDebug, focusHighlighter,
+        fastNavigation, smoothFocus, playbackDiagnostics, releaseDateDiagnostics, playbackDebug, focusHighlighter,
         iCloudSyncEnabled, iCloudLastSyncDate
     ] + SubtitleStyleKey.all
 }
@@ -3071,6 +3073,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.focusedPosterBackdropEnabled) private var focusedPosterBackdropEnabled = true
     @AppStorage(SettingsKey.focusedPosterBackdropDelay) private var focusedPosterBackdropDelay = 3
     @AppStorage(SettingsKey.detailsActionsBelowInfo) private var detailsActionsBelowInfo = false
+    @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
 
     /// Classic was never a distinct layout (behaved like Modern).
     private let layouts = ["Modern", "Grid View", "Compact"]
@@ -3458,6 +3461,13 @@ private struct LayoutDiscoverySettingsView: View {
                         fallback: "Place the Play and action button row below the movie information and synopsis"
                     ),
                     isOn: $detailsActionsBelowInfo,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: "Blur Unwatched Episodes",
+                    subtitle: "Conceal scene spoilers in unwatched episode thumbnails. Episode titles and controls remain sharp.",
+                    isOn: $blurUnwatchedEpisodes,
                     accentColor: accentColor
                 )
             }
@@ -4648,6 +4658,7 @@ private struct TmdbOptionsSheet: View {
             .filter { $0 != .system }
             .map(\.nativeDisplayName)
         return [automaticTmdbLanguageLabel] + manualLanguages
+            + ["English (United States)", "English (United Kingdom)"]
     }
 
     private var tmdbHasApiKey: Bool {
@@ -4659,10 +4670,9 @@ private struct TmdbOptionsSheet: View {
     }
 
     private func normalizeTmdbApiKey() {
-        tmdbApiKey = tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tmdbHasApiKey {
-            tmdbEnabled = false
-        }
+        let trimmed = tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed != tmdbApiKey { tmdbApiKey = trimmed }
+        if trimmed.isEmpty && tmdbEnabled { tmdbEnabled = false }
     }
 
     private var tmdbLanguageSelection: Binding<String> {
@@ -4671,19 +4681,30 @@ private struct TmdbOptionsSheet: View {
                 if TmdbMetadataLanguage.followsApp(in: ProfileSettings.current) {
                     return automaticTmdbLanguageLabel
                 }
-                let language = AppLanguage.fromStored(tmdbLanguage)
-                return (language == .system ? AppLanguage.english : language).nativeDisplayName
+                switch TmdbMetadataLanguage.normalized(tmdbLanguage) {
+                case "en-US": return "English (United States)"
+                case "en-GB": return "English (United Kingdom)"
+                default:
+                    let language = AppLanguage.fromStored(tmdbLanguage)
+                    return (language == .system ? AppLanguage.english : language).nativeDisplayName
+                }
             },
             set: { displayName in
                 if displayName == automaticTmdbLanguageLabel {
                     tmdbFollowAppLanguage = true
                     return
                 }
-                let language = AppLanguage.pickerLanguages.first {
-                    $0 != .system && $0.nativeDisplayName == displayName
-                } ?? .english
-                tmdbLanguage = language.tag
-                tmdbFollowAppLanguage = false
+                let tag: String
+                switch displayName {
+                case "English (United States)": tag = "en-US"
+                case "English (United Kingdom)": tag = "en-GB"
+                default:
+                    tag = AppLanguage.pickerLanguages.first {
+                        $0 != .system && $0.nativeDisplayName == displayName
+                    }?.tag ?? "en"
+                }
+                if tmdbLanguage != tag { tmdbLanguage = tag }
+                if tmdbFollowAppLanguage { tmdbFollowAppLanguage = false }
             }
         )
     }
@@ -9088,6 +9109,7 @@ private struct AdvancedSettingsView: View {
     @State private var showingPlaybackHistory = false
     @AppStorage(SettingsKey.fastNavigation) private var fastNavigation = false
     @AppStorage(SettingsKey.playbackDiagnostics) private var playbackDiagnostics = false
+    @AppStorage(SettingsKey.releaseDateDiagnostics) private var releaseDateDiagnostics = false
     @AppStorage(SettingsKey.playbackDebug) private var playbackDebug = false
     @State private var isClearingTestHistory = false
     @State private var testHistoryStatus = ContinueWatchingTestData.status
@@ -9124,6 +9146,13 @@ private struct AdvancedSettingsView: View {
                     title: L10n.string("tvos_settings_playback_issue_reports", fallback: "Playback Issue Reports"),
                     subtitle: L10n.string("tvos_settings_keep_diagnostic_snapshots_after_failed_p_cd841397", fallback: "Keep diagnostic snapshots after failed playback attempts"),
                     isOn: $playbackDiagnostics,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: "Release Date Diagnostics",
+                    subtitle: "Log selected metadata provider priority, episode date precision and local day only. No add-on URLs, tokens or stream links.",
+                    isOn: $releaseDateDiagnostics,
                     accentColor: accentColor
                 )
 

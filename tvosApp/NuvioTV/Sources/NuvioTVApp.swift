@@ -319,14 +319,32 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
 
 /// Main content view - entry point for the app with screen routing
 struct ContentView: View {
+    private struct PartyDetailsDestination {
+        let screen: TVScreen
+        let tab: TVTab
+        let backStack: [(id: String, type: String)]
+        let returnDestination: DetailsReturnDestination
+        let collectionContext: CollectionPlaybackContext?
+    }
+
+    private struct PartyDetailsOrigin {
+        let context: WatchPartyPlaybackContext
+        let media: WatchPartyMedia
+        let destination: PartyDetailsDestination
+    }
+
     @Environment(\.scenePhase) private var scenePhase
     @State private var activeScreen: TVScreen = .login
     @State private var playbackPartyID: UUID?
     @State private var playerSurfaceID = UUID()
+    /// One-shot percentage-only resume for the built-in player. Exact seconds
+    /// always take precedence. A new handoff clears this value.
+    @State private var playbackResumeFraction: Double?
     @State private var creatingParty = false
     @State private var choosingPartySource = false
     @State private var partyLaunchTask: Task<Void, Never>?
     @State private var partyLaunchID = UUID()
+    @State private var partyDetailsOrigin: PartyDetailsOrigin?
     @State private var resolvedInitialScreen = false
     /// `nil` until tvOS has actually backgrounded the app, so the initial
     /// `.active` callback is never treated as a resume.
@@ -595,6 +613,7 @@ struct ContentView: View {
             }
         }
         .onReceive(authManager.contextWillChange.merge(with: profileViewModel.contextWillChange)) { _ in
+            partyDetailsOrigin = nil
             partyLaunchID = UUID()
             partyLaunchTask?.cancel(); partyLaunchTask = nil
             creatingParty = false; choosingPartySource = false
@@ -684,6 +703,12 @@ struct ContentView: View {
         .onReceive(profileViewModel.$activeProfile.receive(on: RunLoop.main)) { profile in
             syncManager.activeProfileChanged(profile)
             guard profile != nil else { return }
+            // Profile-scoped stores may only finish installing on the next turn.
+            // Retry a previously captured callback after profile restoration.
+            Task { @MainActor in
+                await Task.yield()
+                recoverExternalPlaybackReturnIfPossible()
+            }
             SMBServerStore.shared.reload()
             JellyfinServerStore.shared.reload()
             Task(priority: .utility) {
@@ -700,6 +725,7 @@ struct ContentView: View {
             case .active:
                 syncManager.refreshAccountIfIdle()
                 presentProfileSelectionAfterBackgroundIfNeeded()
+                recoverExternalPlaybackReturnIfPossible()
                 watchPartyOwner.resumeAfterForeground()
             default:
                 break
@@ -963,6 +989,7 @@ struct ContentView: View {
         // generic id guard: callback URLs intentionally carry only a session
         // UUID, not a title id.
         if let callback = ExternalPlaybackCallback.parse(url) {
+            guard ExternalPlaybackSessionStore.stage(callback) else { return }
             switch activeScreen {
             case .login, .profileSelection:
                 pendingDeepLinkURL = url
@@ -1016,105 +1043,19 @@ struct ContentView: View {
     }
 
     private func handleExternalPlaybackCallback(_ callback: ExternalPlaybackCallback) {
-        let profileID = profileViewModel.activeProfile?.id ?? WatchedStore.activeProfileId
-        guard let session = ExternalPlaybackSessionStore.consume(id: callback.id, profileID: profileID) else {
-            return
-        }
-        // An Infuse error callback means the handoff failed. Consuming the
-        // session still makes retries/idempotent duplicate callbacks harmless.
-        guard !callback.isError else { return }
+        ExternalPlaybackReturnHandler.handle(
+            callback, profileID: profileViewModel.activeProfile?.id ?? WatchedStore.activeProfileId
+        )
+    }
 
-        let duration = session.duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
-        let progress = callback.progress ?? callback.position.flatMap { position in
-            guard let duration, position.isFinite, position >= 0 else { return nil }
-            return position / duration
+    private func recoverExternalPlaybackReturnIfPossible() {
+        switch activeScreen {
+        case .login, .profileSelection: return
+        default: break
         }
-        guard let progress, progress.isFinite, (0...1).contains(progress) else { return }
-
-        let isEpisode = session.meta.isSeries && session.season != nil && session.episode != nil
-        guard !session.meta.isSeries || isEpisode else { return }
-
-        if progress > 0, let context = session.collectionContext {
-            CollectionPlaybackOriginStore.recordStarted(
-                meta: session.meta, context: context,
-                activeProfileID: profileID
-            )
-        }
-
-        if RemoteTrackingState.isProgressSourceAuthenticated {
-            // Keep the provider-backed path aligned with built-in playback:
-            // optimistic local state plus one pause/stop report. A zero
-            // fraction is an Infuse close-before-play signal, not playback.
-            let completionFraction = TraktSettingsStore.watchProgressSource == .mdblist
-                ? MdbListProgressService.completionPercent / 100
-                : WatchProgressLedger.completionFraction
-            if progress > 0 {
-                let reportDuration = duration ?? 100
-                let reportPosition = duration.map { $0 * progress } ?? (100 * progress)
-                let action: TraktScrobbleAction = progress >= completionFraction
-                    ? .stop
-                    : .pause
-                let store = ProfileSettings.current
-                if let duration {
-                    TraktProgressService.recordLocalPlayback(
-                        meta: session.meta,
-                        position: reportPosition,
-                        duration: duration,
-                        season: session.season,
-                        episode: session.episode,
-                        notify: action == .stop
-                    )
-                }
-                Task {
-                    _ = await TraktProgressService.reportPlayback(
-                        meta: session.meta,
-                        position: reportPosition,
-                        duration: reportDuration,
-                        season: session.season,
-                        episode: session.episode,
-                        action: action,
-                        store: store
-                    )
-                }
-            }
-            if progress >= completionFraction {
-                _ = WatchedStore.markWatched(
-                    session.meta,
-                    season: session.season,
-                    episode: session.episode
-                )
-            }
-            return
-        }
-
-        if progress >= WatchProgressLedger.completionFraction {
-            if let duration {
-                ContinueWatchingStore.markPlaybackCompleted(
-                    meta: session.meta,
-                    duration: duration,
-                    season: session.season,
-                    episode: session.episode
-                )
-            }
-            _ = WatchedStore.markWatched(
-                session.meta,
-                season: session.season,
-                episode: session.episode
-            )
-        } else if let duration, progress > 0 {
-            let position = duration * progress
-            if position >= WatchProgressLedger.minimumTrackableSeconds {
-                ContinueWatchingDismissStore.clear(contentId: session.meta.id)
-            }
-            ContinueWatchingStore.save(
-                meta: session.meta,
-                streamUrl: session.sourceURL,
-                position: position,
-                duration: duration,
-                season: session.season,
-                episode: session.episode
-            )
-        }
+        _ = ExternalPlaybackReturnHandler.recover(
+            profileID: profileViewModel.activeProfile?.id ?? WatchedStore.activeProfileId
+        )
     }
 
     /// `stremio://…/manifest.json` installs the add-on (same as pasting the URL).
@@ -1139,7 +1080,13 @@ struct ContentView: View {
     /// routing has finished. Preserve it through that gate, then consume it on
     /// the next main-actor turn after the active profile has been installed.
     private func resumePendingDeepLinkIfPossible() {
-        guard pendingDeepLinkURL != nil else { return }
+        if pendingDeepLinkURL == nil {
+            Task { @MainActor in
+                await Task.yield()
+                recoverExternalPlaybackReturnIfPossible()
+            }
+            return
+        }
         Task { @MainActor in
             await Task.yield()
             guard let url = pendingDeepLinkURL else { return }
@@ -1276,7 +1223,8 @@ struct ContentView: View {
     private static func resumePosition(for item: ContinueWatchingItem) -> Double? {
         let currentItem: ContinueWatchingItem
         if RemoteTrackingState.isProgressSourceAuthenticated,
-           let latest = TraktProgressService.currentContinueWatchingItem(for: item.meta) {
+           let latest = TraktProgressService.currentContinueWatchingItem(for: item.meta),
+           latest.season == item.season, latest.episode == item.episode {
             currentItem = latest
         } else {
             currentItem = item
@@ -1288,7 +1236,7 @@ struct ContentView: View {
             // an older checkpoint for the same episode (or no checkpoint at
             // all), so never cross the two progress sources here.
             if RemoteTrackingState.isProgressSourceAuthenticated {
-                return currentItem.isUpNextEntry ? nil : currentItem.resumePosition
+                return currentItem.resumePositionIfKnown
             }
             guard let numbers = currentItem.episodeNumbers else { return nil }
             let episodeId = currentItem.meta.videos?.first {
@@ -1302,7 +1250,7 @@ struct ContentView: View {
             )
         }
         guard !WatchedStore.contains(meta: currentItem.meta) else { return nil }
-        return currentItem.resumePosition
+        return currentItem.resumePositionIfKnown
     }
 
     private static func resumePosition(for meta: NuvioMeta, episode: NuvioVideo?) -> Double? {
@@ -1314,7 +1262,7 @@ struct ContentView: View {
                       item.season == episode.season,
                       item.episode == episode.episode else { return nil }
             }
-            return item.resumePosition
+            return item.resumePositionIfKnown
         }
 
         if meta.isSeries {
@@ -1328,6 +1276,12 @@ struct ContentView: View {
         }
         guard !WatchedStore.contains(meta: meta) else { return nil }
         return ContinueWatchingStore.item(for: meta.id)?.resumePosition
+    }
+
+    private static func resumeFraction(for meta: NuvioMeta, episode: NuvioVideo?) -> Double? {
+        guard RemoteTrackingState.isProgressSourceAuthenticated,
+              let item = TraktProgressService.currentContinueWatchingItem(for: meta) else { return nil }
+        return item.resumeProgressFraction(season: episode?.season, episode: episode?.episode)
     }
 
     private static func seasonSortKey(_ season: Int) -> Int {
@@ -1384,7 +1338,8 @@ struct ContentView: View {
                 meta: item.meta,
                 subtitle: item.episodeSubtitle ?? "",
                 externalSubtitles: [],
-                resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item),
+                resumeFrom: startFromBeginning ? 0 : Self.resumePosition(for: item),
+                resumeFraction: startFromBeginning ? nil : item.resumeProgressFraction,
                 httpHeaders: httpHeaders,
                 collectionContext: provenance
             )
@@ -1445,7 +1400,8 @@ struct ContentView: View {
                     meta: item.meta,
                     subtitle: prepared.subtitleLine,
                     externalSubtitles: prepared.subtitles,
-                    resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item),
+                    resumeFrom: startFromBeginning ? 0 : Self.resumePosition(for: item),
+                    resumeFraction: startFromBeginning ? nil : item.resumeProgressFraction,
                     httpHeaders: prepared.httpHeaders,
                     filename: prepared.filename,
                     videoSize: prepared.videoSize,
@@ -1561,6 +1517,7 @@ struct ContentView: View {
         subtitle: String,
         externalSubtitles: [NuvioSubtitle],
         resumeFrom: Double?,
+        resumeFraction: Double? = nil,
         httpHeaders: [String: String] = [:],
         origin: PlaybackOrigin = .main,
         customPlayer: ExternalPlayer? = nil,
@@ -1623,15 +1580,36 @@ struct ContentView: View {
         if !isActionPlaybackSession && (player == .infuse || player == .senplayer || player == .nativePlayer) {
             let id = UUID().uuidString
             let profileID = profileViewModel.activeProfile?.id ?? WatchedStore.activeProfileId
+            var completionAccounts: [String: String] = [:]
+            let source = TraktSettingsStore.watchProgressSource(in: store)
+            if source == .trakt || RemoteTrackingState.shouldMirrorWatchedHistoryToTrakt(in: store),
+               let account = TraktHistoryService.completionAccountID(in: store, profileId: profileID) {
+                completionAccounts[TraktWatchProgressSource.trakt.rawValue] = account
+            }
+            if source == .wetrakr,
+               let account = WeTrakrProgressService.completionAccountID(in: store, profileId: profileID) {
+                completionAccounts[TraktWatchProgressSource.wetrakr.rawValue] = account
+            }
+            let priorProgress = WatchProgressLedger.record(
+                contentId: meta.id, season: meta.isSeries ? numbers?.season : nil,
+                episode: meta.isSeries ? numbers?.episode : nil
+            )
             externalSession = ExternalPlaybackSession(
                 id: id,
                 meta: meta.persistenceSnapshot,
                 sourceURL: url.absoluteString,
                 season: meta.isSeries ? numbers?.season : nil,
                 episode: meta.isSeries ? numbers?.episode : nil,
-                duration: Self.runtimeSeconds(meta.runtime),
+                // A show-wide runtime is not a verified episode duration.
+                // Only an already-measured per-title duration is eligible
+                // for completion. Generic metadata runtime is an estimate.
+                duration: priorProgress.flatMap { $0.duration >= 60 ? $0.duration : nil },
                 profileID: profileID,
-                collectionContext: provenance
+                collectionContext: provenance,
+                startedAt: Date(),
+                progressSource: source.rawValue,
+                completionAccounts: completionAccounts,
+                externalPlayerName: player.rawValue
             )
             successCallback = URL(string: "nuvio-krystian://external-playback/\(id)")
             errorCallback = URL(string: "nuvio-krystian://external-playback/error/\(id)")
@@ -1662,12 +1640,16 @@ struct ContentView: View {
                successURL: successCallback,
                errorURL: errorCallback
            ),
-           UIApplication.shared.canOpenURL(launchURL) {
+           UIApplication.shared.canOpenURL(launchURL),
+           externalSession.map({ ExternalPlaybackSessionStore.save($0) }) ?? true {
             PlaybackStartupTiming.cancel(token: startupBenchmarkToken)
-            if let externalSession {
-                ExternalPlaybackSessionStore.save(externalSession)
+            UIApplication.shared.open(launchURL, options: [:]) { opened in
+                if !opened, let externalSession {
+                    _ = ExternalPlaybackSessionStore.consume(
+                        id: externalSession.id, profileID: externalSession.profileID
+                    )
+                }
             }
-            UIApplication.shared.open(launchURL, options: [:], completionHandler: nil)
             return
         }
 
@@ -1678,6 +1660,7 @@ struct ContentView: View {
             httpHeaders: httpHeaders,
             externalSubtitles: externalSubtitles,
             resumeFrom: isActionPlaybackSession ? nil : resumeFrom,
+            resumeFraction: isStandalonePlaybackSession ? nil : resumeFraction,
             origin: origin,
             cacheFileIdentity: cacheFileIdentity,
             filename: filename,
@@ -1692,7 +1675,7 @@ struct ContentView: View {
     /// Host from Details without starting a stream. The server owns room-code
     /// generation; membership and uncertain outcomes stay in WatchPartyService.
     private func createWatchPartyFromDetails(meta: NuvioMeta, episode: NuvioVideo?) {
-        guard WatchPartyConfiguration.isEnabled else { return }
+        guard WatchPartyConfiguration.isEnabled, case .details = activeScreen else { return }
         guard let service = watchPartyOwner.service, partyLaunchTask == nil else { return }
         guard authManager.isAuthenticated, !authManager.sessionNeedsReauthentication,
               profileViewModel.activeProfile != nil else {
@@ -1719,6 +1702,12 @@ struct ContentView: View {
             return
         }
         watchPartyOwner.message = nil
+        let destination = PartyDetailsDestination(
+            screen: activeScreen, tab: selectedTab, backStack: detailsBackStack,
+            returnDestination: detailsReturnDestination, collectionContext: detailsCollectionContext
+        )
+        let detailsGeneration = detailsDidDisappearGeneration
+        partyDetailsOrigin = nil
         let mark = UUID()
         partyLaunchID = mark
         partyLaunchTask = Task { @MainActor in
@@ -1726,7 +1715,10 @@ struct ContentView: View {
             do {
                 try await service.create(media: media, playback: nil)
                 guard !Task.isCancelled, partyLaunchID == mark,
-                      watchPartyOwner.service === service else { return }
+                      watchPartyOwner.service === service,
+                      activeScreen == destination.screen,
+                      detailsDidDisappearGeneration == detailsGeneration else { return }
+                rememberPartyDetailsOrigin(destination, media: media, service: service)
                 creatingParty = false
                 choosingPartySource = false
                 partyLaunchTask = nil
@@ -1734,12 +1726,50 @@ struct ContentView: View {
                 activeScreen = .main
             } catch {
                 guard !Task.isCancelled, partyLaunchID == mark,
-                      watchPartyOwner.service === service else { return }
+                      watchPartyOwner.service === service,
+                      activeScreen == destination.screen,
+                      detailsDidDisappearGeneration == detailsGeneration else { return }
+                rememberPartyDetailsOrigin(destination, media: media, service: service)
                 watchPartyOwner.message = "Watch Party could not create the room. Check the room status before retrying."
                 partyLaunchTask = nil
                 selectedTab = .party
                 activeScreen = .main
             }
+        }
+    }
+
+    private func rememberPartyDetailsOrigin(_ destination: PartyDetailsDestination,
+                                            media: WatchPartyMedia, service: WatchPartyService) {
+        guard watchPartyOwner.service === service,
+              let context = service.session?.playbackContext,
+              service.isCurrent(context.request), context.mediaKey == media.key else { return }
+        partyDetailsOrigin = PartyDetailsOrigin(context: context, media: media, destination: destination)
+    }
+
+    private var partyDetailsBackdrop: WatchPartyMedia? {
+        guard let origin = partyDetailsOrigin, let service = watchPartyOwner.service,
+              service.isCurrent(origin.context.request),
+              let current = service.session?.playbackContext,
+              WatchPartyDetailsPresentationPolicy.sameMembership(origin.context, current) else { return nil }
+        return origin.media
+    }
+
+    private func didExitWatchPartyRoom(_ context: WatchPartyPlaybackContext) {
+        guard let origin = partyDetailsOrigin,
+              WatchPartyDetailsPresentationPolicy.sameMembership(origin.context, context) else { return }
+        partyDetailsOrigin = nil
+        guard let service = watchPartyOwner.service, service.isCurrent(context.request),
+              service.session?.party == nil, activeScreen == .main, selectedTab == .party else { return }
+        creatingParty = false; choosingPartySource = false
+        pendingDetailsPlaybackRequestID = nil
+        reopenStreamPickerOnDetails = false
+        reopenStreamPickerEpisode = nil
+        detailsBackStack = origin.destination.backStack
+        detailsReturnDestination = origin.destination.returnDestination
+        detailsCollectionContext = origin.destination.collectionContext
+        selectedTab = origin.destination.tab
+        withAnimation(.easeInOut(duration: 0.24)) {
+            activeScreen = origin.destination.screen
         }
     }
 
@@ -1873,6 +1903,7 @@ struct ContentView: View {
         httpHeaders: [String: String],
         externalSubtitles: [NuvioSubtitle],
         resumeFrom: Double?,
+        resumeFraction: Double? = nil,
         origin: PlaybackOrigin,
         cacheFileIdentity: PlaybackCacheFileIdentity? = nil,
         filename: String? = nil,
@@ -1883,6 +1914,7 @@ struct ContentView: View {
         collectionContext: CollectionPlaybackContext? = nil,
         party: WatchPartyAppOwner.Presentation? = nil
     ) {
+        playbackResumeFraction = party == nil && (resumeFrom ?? 0) <= 0 ? resumeFraction : nil
         if party == nil {
             partyLaunchID = UUID()
             partyLaunchTask?.cancel(); partyLaunchTask = nil
@@ -2218,7 +2250,10 @@ struct ContentView: View {
             authManager: authManager,
             syncManager: syncManager,
             watchPartyOwner: watchPartyOwner,
+            partyDetailsMedia: partyDetailsBackdrop,
+            onPartyRoomExited: didExitWatchPartyRoom,
             onCreateParty: {
+                partyDetailsOrigin = nil
                 creatingParty = true; choosingPartySource = false
                 reopenStreamPickerOnDetails = false
                 reopenStreamPickerEpisode = nil
@@ -2447,6 +2482,7 @@ struct ContentView: View {
                         subtitle: subtitle,
                         externalSubtitles: externalSubtitles,
                         resumeFrom: isActionPlaybackSession ? nil : (isTrailer ? resumeFrom : (resumeFrom ?? Self.resumePosition(for: meta, episode: currentEpisode))),
+                        resumeFraction: isActionPlaybackSession || isTrailer || resumeFrom != nil ? nil : Self.resumeFraction(for: meta, episode: currentEpisode),
                         httpHeaders: httpHeaders,
                         origin: .details,
                         customPlayer: player,
@@ -2988,6 +3024,7 @@ struct ContentView: View {
             httpHeaders: httpHeaders,
             externalSubtitles: externalSubtitles,
             resumeFrom: resumeFrom,
+            resumeFraction: playbackResumeFraction,
             isActionPlaybackSession: isActionPlaybackSession,
             playbackOrigin: playbackOrigin,
             filename: isStandalonePlaybackSession ? nil : playbackFilename,
@@ -3540,6 +3577,8 @@ private struct TVMainTabView: View {
     let authManager: AuthManager
     let syncManager: NuvioSyncManager
     @ObservedObject var watchPartyOwner: WatchPartyAppOwner
+    var partyDetailsMedia: WatchPartyMedia? = nil
+    var onPartyRoomExited: (WatchPartyPlaybackContext) -> Void = { _ in }
     let onCreateParty: () -> Void
     let onChoosePartySource: (WatchPartyMedia) -> Void
     let partyIsChoosing: Bool
@@ -3805,7 +3844,8 @@ private struct TVMainTabView: View {
                 canUseAccount: isAuthenticated && !sessionNeedsReauthentication && activeProfile != nil,
                 isChoosing: partyIsChoosing, onCreate: onCreateParty,
                 onChooseSource: onChoosePartySource, onCancelSelection: onCancelPartySelection,
-                onOpenProfile: onSwitchProfile)
+                onOpenProfile: onSwitchProfile,
+                detailsMedia: partyDetailsMedia, onRoomExited: onPartyRoomExited)
         } else {
             Text("Sign in and choose a profile to use Watch Party.")
         }
@@ -4267,6 +4307,12 @@ private enum TVHomeProfileFocusTarget: Equatable {
     }
 }
 
+enum TVHomeTabRefreshPolicy {
+    static func needsInitialProgressFetch(initialFinished: Bool, sourceChanged: Bool) -> Bool {
+        !initialFinished || sourceChanged
+    }
+}
+
 struct TVHomeView: View {
     /// Failure sets a retry already ran against without improving them, keyed by
     /// the signature itself (which encodes the add-on set, so two profiles never
@@ -4344,6 +4390,7 @@ struct TVHomeView: View {
     @State private var localTitlesSection: TVHomeSection?
     @State private var jellyfinSection: TVHomeSection?
     @State private var isLoading = true
+    @State private var initialProgressRefreshFinished = false
     @State private var profileGateFailedLoadIdentity: TVHomeContentIdentity?
     @State private var focusedMeta: NuvioMeta?
     /// Collection folder currently focused on Home. When set, the hero shows
@@ -4360,6 +4407,7 @@ struct TVHomeView: View {
     /// Add-on/catalog settings the last completed load actually read.
     @State private var lastLoadedInputSignature: String?
     @State private var rawContinueWatchingItems: [ContinueWatchingItem] = []
+    @State private var lastReleaseEligibilitySignature: String?
     @State private var appliedContinueWatchingSort: String?
     @State private var continueWatching: [ContinueWatchingItem] = []
     @State private var upcomingItems: [ContinueWatchingItem] = []
@@ -4741,7 +4789,7 @@ struct TVHomeView: View {
                     .allowsHitTesting(false)
             }
         }
-        .task(id: "\(contentIdentity.profileId):\(contentIdentity.catalogRevision):\(tmdbHomeSettingsKey):\(collectionHome == nil || isActive)") {
+        .task(id: "\(contentIdentity.profileId):\(contentIdentity.catalogRevision):\(tmdbHomeSettingsKey)") {
             guard collectionHome == nil || isActive else { return }
             focusWork.heroEnrichmentTask?.cancel()
             focusWork.enrichedHeroMetadata.removeAll()
@@ -4749,12 +4797,33 @@ struct TVHomeView: View {
             let inputsChanged = repository.homeCatalogInputSignature != lastLoadedInputSignature
             await loadWithAutomaticRetry(for: contentIdentity, forceReload: !isLoaded || inputsChanged)
             if !isLoaded, collectionHome == nil {
-                // Add-on metadata providers are configured by the time Home has
-                // loaded, so this is the pass that recovers titles an earlier sync
-                // could not resolve. Mirrors the phone's
-                // `retryMetadataResolutionWhenAddonMetaProvidersReady`.
-                ContinueWatchingBuilder.scheduleRebuild(reason: "home loaded")
+                // Catalog loading has configured the metadata providers; fill
+                // any remaining episode details using those providers.
                 await ContinueWatchingStore.refreshMissingEpisodeDetails()
+            }
+        }
+        .task(id: "\(contentIdentity.profileId):\(store.hasPresentedHome)") {
+            guard collectionHome == nil, !store.hasPresentedHome else { return }
+            var gate = TVHomeStartupGate()
+            let clock = ContinuousClock()
+            let started = clock.now
+            while !Task.isCancelled {
+                let progressReady = !continueWatchingVisible || (
+                    initialProgressRefreshFinished
+                    && NuvioSyncManager.current?.isHomePullPending != true
+                    && !ContinueWatchingBuilder.isRebuildPending
+                )
+                let elapsed = started.duration(to: clock.now).components
+                if gate.update(
+                    elapsed: Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18,
+                    isReady: !isLoading && progressReady
+                ) {
+                    refreshContinueWatching()
+                    store.hasPresentedHome = true
+                    return
+                }
+                do { try await Task.sleep(for: .milliseconds(100)) }
+                catch { return }
             }
         }
         .task(id: "\(contentIdentity.profileId):\(collectionsRevision)") {
@@ -4798,8 +4867,15 @@ struct TVHomeView: View {
             if homeLayout == "Classic" { homeLayout = "Modern" }
             refreshContinueWatching()
             refreshWatchedTitles()
-            scheduleContinueWatchingRefresh()
-            scheduleTraktWatchedHistorySync()
+            // A returning tab must not refetch progress just because it remounted.
+            // First load / a changed progress source still needs initial data.
+            if TVHomeTabRefreshPolicy.needsInitialProgressFetch(
+                initialFinished: initialProgressRefreshFinished,
+                sourceChanged: displayedProgressSource != selectedProgressSource
+            ) {
+                scheduleContinueWatchingRefresh()
+                scheduleTraktWatchedHistorySync()
+            }
         }
         // Home stays mounted behind Details/Player, so `onAppear` no longer
         // fires on return. Refresh the Continue Watching row whenever the store
@@ -4839,6 +4915,11 @@ struct TVHomeView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification).receive(on: RunLoop.main)) { _ in
             guard collectionHome == nil else { return }
+            // Local Infuse callbacks are already durable. Show them immediately
+            // before the provider refresh, even beneath a Details overlay.
+            if usesRemoteProgress {
+                refreshRemoteContinueWatchingImmediately()
+            }
             guard isActive else { return }
             if isFullScreenOverlayPresented {
                 pendingContinueWatchingRefreshAfterOverlay = true
@@ -4899,10 +4980,19 @@ struct TVHomeView: View {
                         }
                     }
                 }
-                if usesRemoteProgress {
+                // Keep existing rows and their scroll/focus state. Progress
+                // notifications, profile/provider changes and freshness policies
+                // perform real refreshes; tab visibility alone does not.
+                if TVHomeTabRefreshPolicy.needsInitialProgressFetch(
+                initialFinished: initialProgressRefreshFinished,
+                sourceChanged: displayedProgressSource != selectedProgressSource
+            ) {
                     scheduleContinueWatchingRefresh()
-                } else {
+                } else if !usesRemoteProgress {
                     refreshContinueWatching()
+                }
+                if !rawContinueWatchingItems.isEmpty {
+                    setContinueWatching(rawContinueWatchingItems)
                 }
                 #if DEBUG
                 logRowWindow("home became active")
@@ -5075,11 +5165,10 @@ struct TVHomeView: View {
     var body: some View {
         let _ = TVHomeDebugTrace.breadcrumb("home.body.render active=\(isActive) row=\(focusedRowIndex)")
         homeBodySecondHalf
-        .onChange(of: isLoading) { _, loading in
-            TVHomeDebugTrace.log("home.onChange(isLoading) loading=\(loading) showsLoading=\(showsLoading)")
-            if loading && showsLoading {
+        .onChange(of: showsLoading) { _, loading in
+            if loading {
                 requestLoadingFocus()
-            } else if !loading || !showsLoading {
+            } else {
                 isLoadingFocusActive = false
             }
         }
@@ -5119,7 +5208,19 @@ struct TVHomeView: View {
         }
         .onChange(of: isActive) { oldVal, active in
             if !oldVal && active && !isFullScreenOverlayPresented {
+                // Catalog refresh is TTL-based, not a side effect of switching
+                // tabs. This call is a no-op unless the configured TTL expired.
                 checkAndTriggerAutoRefresh()
+            }
+        }
+        // Local status can cross midnight or an exact release instant while
+        // Home remains visible. No network call or card clearing is required.
+        .task(id: contentIdentity.profileId) {
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(30)) }
+                catch { return }
+                guard !Task.isCancelled, isActive, !rawContinueWatchingItems.isEmpty else { continue }
+                setContinueWatching(rawContinueWatchingItems)
             }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -5845,9 +5946,7 @@ struct TVHomeView: View {
     /// load. When returning from a card the sections are already cached in the
     /// store, so we render them straight away instead of flashing the spinner.
     private var showsLoading: Bool {
-        // Account progress is available before the add-on catalog requests
-        // finish. Do not cover a ready Continue Watching row with the global
-        // spinner while BetterPosters (or another large add-on) is loading.
+        if collectionHome == nil { return !store.hasPresentedHome }
         return isLoading
             && store.sections.isEmpty
             && continueWatching.isEmpty
@@ -5898,6 +5997,9 @@ struct TVHomeView: View {
             return .waiting(hasFocusableContent: false, targetSignature: nil)
         }
         if isFullScreenOverlayPresented { return .overlay }
+        guard !showsLoading else {
+            return .waiting(hasFocusableContent: false, targetSignature: nil)
+        }
         let target = profileGateStartupFocusTarget
         if let target {
             return .ready(
@@ -7231,6 +7333,11 @@ struct TVHomeView: View {
             )
             store.finishLoad(generation, for: identity)
             lastLoadedInputSignature = inputSignature
+            // Arm this before clearing isLoading: a partial catalog retry can
+            // otherwise reveal Home before the metadata recovery pass starts.
+            if !store.hasPresentedHome {
+                ContinueWatchingBuilder.scheduleRebuild(reason: "home loaded")
+            }
             refreshContinueWatching()
             refreshWatchedTitles()
             isLoading = false
@@ -8114,13 +8221,16 @@ struct TVHomeView: View {
     /// Publish Continue Watching and derived lookups together, outside body.
     private func setContinueWatching(_ rawItems: [ContinueWatchingItem]) {
         refreshContinueWatchingOrigins(rawItems)
+        let eligibilitySignature = rawItems.map {
+            "\($0.meta.id)|\($0.season ?? -1):\($0.episode ?? -1)|\($0.hasAired)|\($0.isAiringToday)|\($0.isNewEpisodeDrop)"
+        }.joined(separator: ";")
         if appliedContinueWatchingSort == continueWatchingSort,
+           lastReleaseEligibilitySignature == eligibilitySignature,
            rawContinueWatchingItems.count == rawItems.count {
             let isIdentical = zip(rawContinueWatchingItems, rawItems).allSatisfy { $0.isContentEqual(to: $1) }
-            if isIdentical {
-                return
-            }
+            if isIdentical { return }
         }
+        lastReleaseEligibilitySignature = eligibilitySignature
         appliedContinueWatchingSort = continueWatchingSort
         rawContinueWatchingItems = rawItems
         let (items, upcoming): ([ContinueWatchingItem], [ContinueWatchingItem]) = {
@@ -8261,6 +8371,22 @@ struct TVHomeView: View {
         }
     }
 
+    /// Apply callback checkpoints without waiting for Trakt's next network
+    /// response, including when Home remained mounted behind Details.
+    private func refreshRemoteContinueWatchingImmediately() {
+        guard collectionHome == nil, usesRemoteProgress else { return }
+        let items = TraktProgressService.immediateContinueWatchingItems(
+            source: selectedProgressSource,
+            profileId: ContinueWatchingStore.activeProfileId
+        )
+        var seen = Set<String>()
+        setContinueWatching(items.filter {
+            shouldDisplayContinueWatchingItem($0)
+                && seen.insert($0.meta.id).inserted
+        })
+        displayedProgressSource = selectedProgressSource
+    }
+
     private func scheduleContinueWatchingRefresh() {
         guard collectionHome == nil else { return }
         continueWatchingRefreshTask?.cancel()
@@ -8300,6 +8426,7 @@ struct TVHomeView: View {
     private func refreshContinueWatchingFromSelectedSource() async {
         guard collectionHome == nil else { return }
         continueWatchingRefreshGeneration &+= 1
+        if !store.hasPresentedHome { initialProgressRefreshFinished = false }
         let generation = continueWatchingRefreshGeneration
         let profileID = ContinueWatchingStore.activeProfileId
         let source = selectedProgressSource
@@ -8311,6 +8438,12 @@ struct TVHomeView: View {
             finishSimklHomeLoadingDiagnostic()
         }
         defer {
+            if !Task.isCancelled,
+               generation == continueWatchingRefreshGeneration,
+               profileID == ContinueWatchingStore.activeProfileId,
+               source == selectedProgressSource {
+                initialProgressRefreshFinished = true
+            }
             if isSimklRefresh, generation == continueWatchingRefreshGeneration {
                 finishSimklHomeLoadingDiagnostic()
             }
@@ -9748,6 +9881,8 @@ final class TVHomeStore: ObservableObject {
         didSet { sectionsRevision &+= 1 }
     }
     @Published var sectionsRevision: UInt = 0
+    /// A mounted Home is revealed once; background reloads never cover it again.
+    @Published var hasPresentedHome = false
     @Published var hero: NuvioMeta?
     @Published var lastLoadedAt: Date?
     /// True when any last-known-good tree is available. Cache reuse additionally
@@ -9772,6 +9907,7 @@ final class TVHomeStore: ObservableObject {
         let previousProfileId = loadedContentIdentity?.profileId
             ?? loadingContentIdentity?.profileId
         if let previousProfileId, previousProfileId != identity.profileId {
+            hasPresentedHome = false
             sections = []
             hero = nil
             lastFocusedCardID = nil
@@ -9813,6 +9949,7 @@ final class TVHomeStore: ObservableObject {
 
     func reset() {
         loadGeneration &+= 1
+        hasPresentedHome = false
         sections = []
         hero = nil
         hasLoaded = false

@@ -37,7 +37,6 @@ scripts/build-distribution.sh
 asset
 scripts/scrape_android_compose_animation_docs.py
 tools
-AGENTS.md
 server
 
 # Local Android TV reference checkout; this tvOS repository does not track it
@@ -75,3 +74,19 @@ tvosApp/Configurations/Signing.local.xcconfig
 *.mobileprovision
 *.p12
 *.p8
+
+# Nuvio-K preparation: private state belongs outside the checkout.
+/krystian-build-private/
+/.krystian-build/
+*.xcresult/
+*.app/
+*.log
+*.pem
+*.key
+__pycache__/
+*.pyc
+# Only the reusable workflow is added from the otherwise ignored docs folder.
+!/docs/
+/docs/*
+!/docs/CODEX_WORKFLOW.md
+!/docs/krystian-validation-2026-10-20.md

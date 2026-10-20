@@ -640,6 +640,12 @@ struct TVCatalogRow: View {
                     continueEpisodeArtworkURL: progressItem?.episodeArtworkURL
                         ?? (id == TVHomeSection.upcomingId ? progressItem?.meta.backdropUrl : nil),
                     continueIsUpNext: progressItem?.isUpNextEntry == true,
+                    continueEpisodeIsWatched: progressItem.flatMap { progress -> Bool? in
+                        guard let numbers = progress.episodeNumbers else { return nil }
+                        return WatchedStore.containsEpisode(
+                            meta: progress.meta, season: numbers.season, episode: numbers.episode
+                        ) || (!progress.isUpNextEntry && progress.progress >= 1.0)
+                    } ?? false,
                     continueUpNextBadgeText: progressItem?.upNextBadgeText,
                     collectionOrigin: id == TVHomeSection.continueWatchingId && progressItem?.isUpNextEntry == false
                         ? collectionOriginsByItemId[item.id] : nil,

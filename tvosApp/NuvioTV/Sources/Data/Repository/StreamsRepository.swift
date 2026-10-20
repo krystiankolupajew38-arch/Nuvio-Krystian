@@ -18,7 +18,7 @@ final class StreamsRepository: ObservableObject {
 
     /// Bounded per-add-on stream request timeout (seconds). Dead providers
     /// finish as failed without blocking the rest or smart autoplay forever.
-    static let streamRequestTimeout: TimeInterval = 18
+    nonisolated static let streamRequestTimeout: TimeInterval = 18
 
     @Published private(set) var state = StreamsDiscoveryState()
 
@@ -294,6 +294,11 @@ final class StreamsRepository: ObservableObject {
             hasResolvedTargets: true
         )
 
+        // Fetch subtitle metadata concurrently with stream add-ons to avoid
+        // extending the loading spinner after streams finish.
+        async let pendingExternalSubtitles = fetchExternalSubtitles(
+            type: type, videoId: videoId, manifestURLs: enabledURLs)
+
         await withTaskGroup(of: GroupUpdate.self) { group in
             for target in targets {
                 group.addTask {
@@ -316,8 +321,7 @@ final class StreamsRepository: ObservableObject {
         // external subtitle decoration finishes. Stay "loading" through that step.
         publish(groups: state.groups, requestKey: requestKey, forceLoading: true)
 
-        let externalSubtitles = await fetchExternalSubtitles(
-            type: type, videoId: videoId, manifestURLs: enabledURLs)
+        let externalSubtitles = await pendingExternalSubtitles
         guard !Task.isCancelled, activeRequestKey == requestKey else { return }
 
         var finalGroups = state.groups
@@ -459,18 +463,20 @@ final class StreamsRepository: ObservableObject {
         }
     }
 
-    private static func fetchStreams(
+    nonisolated private static func fetchStreams(
         from url: URL,
         addonName: String,
         logo: String?
     ) async throws -> [NuvioStream] {
-        var request = URLRequest(url: url)
+        // Explicit reload must re-query the provider, not reuse URLSession HTTP cache.
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         request.timeoutInterval = streamRequestTimeout
         request.setValue("Mozilla/5.0 (AppleTV; tvOS 18.0) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
             throw URLError(.badServerResponse)
         }
+        try Task.checkCancellation()
         let decoded = try JSONDecoder().decode(StreamAddonResponse.self, from: data)
         return (decoded.streams ?? []).compactMap { raw in
             guard let stream = raw.toNuvioStream(addonName: addonName) else { return nil }
@@ -515,7 +521,7 @@ final class StreamsRepository: ObservableObject {
         return result
     }
 
-    private static let manifestSession: URLSession = {
+    nonisolated private static let manifestSession: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 8
         config.timeoutIntervalForResource = 10
@@ -523,7 +529,7 @@ final class StreamsRepository: ObservableObject {
         return URLSession(configuration: config)
     }()
 
-    private static func fetchManifest(_ url: URL) async -> StreamAddonManifest? {
+    nonisolated private static func fetchManifest(_ url: URL) async -> StreamAddonManifest? {
         var request = URLRequest(url: url)
         request.timeoutInterval = 8
         guard let (data, response) = try? await manifestSession.data(for: request),

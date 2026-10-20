@@ -982,7 +982,138 @@ extension NuvioMeta {
     }
 }
 
+/// Pure presentation policy shared by Details and Home.
+enum EpisodeSpoilerPolicy {
+    static func shouldBlur(
+        enabled: Bool,
+        isWatched: Bool,
+        hasEpisodeArtwork: Bool,
+        displaysEpisodeArtwork: Bool = true
+    ) -> Bool {
+        enabled && !isWatched && hasEpisodeArtwork && displaysEpisodeArtwork
+    }
+}
+
 enum EpisodeReleasePolicy {
+    enum Precision: String {
+        case exact
+        case localTime
+        case dateOnly
+        case invalid
+    }
+
+    /// Preserves the distinction between an instant and a calendar statement.
+    /// Never infer a US broadcast hour from a bare YYYY-MM-DD.
+    static func precision(of value: String?, timeZone: TimeZone = .current) -> Precision {
+        guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return .invalid }
+        if raw.count == 10 {
+            return validatedCalendarDay(raw) == nil ? .invalid : .dateOnly
+        }
+        guard raw.count >= 16, raw.count <= 40,
+              raw.range(of: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?$"#, options: .regularExpression) != nil,
+              validatedCalendarDay(String(raw.prefix(10))) != nil else {
+            return .invalid
+        }
+        // Prevent tolerant platform parsers normalizing impossible clock values.
+        guard let hour = Int(raw.dropFirst(11).prefix(2)),
+              let minute = Int(raw.dropFirst(14).prefix(2)),
+              hour < 24, minute < 60 else { return .invalid }
+        if raw.dropFirst(16).first == ":" {
+            guard let second = Int(raw.dropFirst(17).prefix(2)), second < 60 else {
+                return .invalid
+            }
+        }
+        if let offset = raw.range(of: #"[+-]\d{2}:?\d{2}$"#, options: .regularExpression) {
+            let digits = String(raw[offset].dropFirst().filter { $0.isNumber })
+            guard digits.count == 4,
+                  let offsetHour = Int(digits.prefix(2)),
+                  let offsetMinute = Int(digits.suffix(2)),
+                  offsetHour <= 23, offsetMinute < 60 else { return .invalid }
+        }
+        let zoned = raw.hasSuffix("Z")
+            || raw.range(of: #"[+-]\d{2}:?\d{2}$"#, options: .regularExpression) != nil
+        if zoned {
+            return zonedTimestamp(raw) == nil ? .invalid : .exact
+        }
+        return localTimestamp(raw, timeZone: timeZone) == nil ? .invalid : .localTime
+    }
+
+    /// Original/add-on values win equally precise conflicts. Exact timestamps
+    /// beat date-only TMDB air_date, while a valid TMDB day can fill a gap.
+    static func preferredRelease(primary: String?, fallback: String?) -> String? {
+        let ranking: [Precision: Int] = [.invalid: 0, .dateOnly: 1, .localTime: 2, .exact: 3]
+        let preferredPrecision = precision(of: primary)
+        let fallbackPrecision = precision(of: fallback)
+        if (ranking[preferredPrecision] ?? 0) > 0,
+           (ranking[preferredPrecision] ?? 0) >= (ranking[fallbackPrecision] ?? 0) {
+            return primary
+        }
+        return (ranking[fallbackPrecision] ?? 0) > 0 ? fallback : nil
+    }
+
+    private static func validatedCalendarDay(_ day: String) -> String? {
+        guard day.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil,
+              let year = Int(day.prefix(4)),
+              let month = Int(day.dropFirst(5).prefix(2)),
+              let date = Int(day.suffix(2)) else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        guard let parsed = calendar.date(from: DateComponents(year: year, month: month, day: date)) else { return nil }
+        let parts = calendar.dateComponents([.year, .month, .day], from: parsed)
+        return parts.year == year && parts.month == month && parts.day == date ? day : nil
+    }
+
+    private static let timestampFormatterLock = NSLock()
+
+    private static func zonedTimestamp(_ raw: String) -> Date? {
+        timestampFormatterLock.lock()
+        defer { timestampFormatterLock.unlock() }
+        let normalized: String
+        if raw.range(of: #"[+-]\d{4}$"#, options: .regularExpression) != nil {
+            let before = raw.dropLast(5)
+            let offset = raw.suffix(5)
+            normalized = "\(before)\(offset.prefix(3)):\(offset.suffix(2))"
+        } else {
+            normalized = raw
+        }
+        // ISO8601DateFormatter expects seconds; some add-ons provide HH:mm.
+        let withSeconds = normalized.replacingOccurrences(
+            of: #"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(Z|[+-]\d{2}:\d{2})$"#,
+            with: "$1:00$2", options: .regularExpression
+        )
+        return fractionalISO8601Formatter.date(from: withSeconds)
+            ?? standardISO8601Formatter.date(from: withSeconds)
+    }
+
+    private static func localTimestamp(_ raw: String, timeZone: TimeZone) -> Date? {
+        let pattern = #"^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: raw, range: NSRange(raw.startIndex..., in: raw)),
+              match.range.length == (raw as NSString).length else { return nil }
+        func component(_ index: Int) -> Int? {
+            guard match.range(at: index).location != NSNotFound,
+                  let range = Range(match.range(at: index), in: raw) else { return nil }
+            return Int(raw[range])
+        }
+        guard let year = Int(raw.prefix(4)),
+              let month = Int(raw.dropFirst(5).prefix(2)),
+              let day = Int(raw.dropFirst(8).prefix(2)),
+              let hour = component(2), let minute = component(3),
+              hour < 24, minute < 60 else { return nil }
+        let second = component(4) ?? 0
+        guard second < 60 else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let parts = DateComponents(year: year, month: month, day: day, hour: hour, minute: minute, second: second)
+        guard let result = calendar.date(from: parts) else { return nil }
+        let verified = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: result)
+        guard verified.year == year, verified.month == month, verified.day == day,
+              verified.hour == hour, verified.minute == minute, verified.second == second else {
+            return nil
+        }
+        return result
+    }
     static let showUnairedNextUpKey = "nuvio.tv.settings.layout.showUnairedNextUp"
     static let upcomingNextSeasonWindowDays = 7
     /// The window during which an aired up-next episode is presented as new.
@@ -1023,8 +1154,7 @@ enum EpisodeReleasePolicy {
         // aired" once local time passes UTC midnight — 02:00 in UTC+2. Keep it
         // day-based so an episode airing today stays "today" all day, exactly
         // as `isAiringToday` compares calendar days.
-        let trimmed = released?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let day = isoDay(released), day == trimmed {
+        if precision(of: released) == .dateOnly, let day = localReleaseDay(released) {
             return day < todayIsoDay()
         }
         guard let releaseDate = releaseDate(for: released) else { return true }
@@ -1068,7 +1198,9 @@ enum EpisodeReleasePolicy {
         if isAiringToday(released) {
             return L10n.string("date_today", fallback: "Today")
         }
-        return NuvioDateDisplay.formattedDate(released) ?? released.prefix(10).description
+        let localDay = localReleaseDay(released)
+        return localDay.flatMap { NuvioDateDisplay.formattedDate($0) }
+            ?? localDay ?? released
     }
 
     /// True when `released` is a real timestamp within the last `days` days.
@@ -1095,89 +1227,77 @@ enum EpisodeReleasePolicy {
         return isRecentlyReleased(released, within: newEpisodeWindowDays)
     }
 
-    /// Parses the exact release timestamp when one is supplied. Date-only
-    /// values fall back to midnight UTC, matching Android's
-    /// `parseReleaseDateToEpochMs` behavior.
-    static func releaseDate(for released: String?) -> Date? {
-        guard let raw = released?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty else { return nil }
-
+    /// All consumers use this parser. Zoned values are true instants, local
+    /// timestamps are interpreted in the device zone, and date-only metadata
+    /// remains a calendar statement (UTC midnight only as a sort key).
+    static func releaseDate(for released: String?, timeZone: TimeZone = .current) -> Date? {
+        guard let raw = released?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        // Unlike exact timestamps, timezone-less values are dependent on the
+        // device's current timezone and must not reuse another zone's cache.
+        let kind = precision(of: raw, timeZone: timeZone)
+        let cacheKey = kind == .localTime ? "\(timeZone.identifier)|\(raw)" : raw
         releaseDateCacheLock.lock()
         defer { releaseDateCacheLock.unlock() }
-        if let cached = releaseDateCache[raw] {
-            return cached.value
-        }
-
+        if let cached = releaseDateCache[cacheKey] { return cached.value }
         let parsed: Date?
-        if !raw.contains("T"), let day = isoDay(raw) {
-            let parts = day.split(separator: "-").compactMap { Int($0) }
-            if parts.count == 3 {
-                var calendar = Calendar(identifier: .gregorian)
-                calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
-                var components = DateComponents()
-                components.year = parts[0]
-                components.month = parts[1]
-                components.day = parts[2]
-                parsed = calendar.date(from: components)
-            } else {
-                parsed = nil
-            }
-        } else if let date = fractionalISO8601Formatter.date(from: raw) {
-            parsed = date
-        } else if let date = standardISO8601Formatter.date(from: raw) {
-            parsed = date
-        } else if let day = isoDay(raw) {
-            let parts = day.split(separator: "-").compactMap { Int($0) }
-            guard parts.count == 3 else {
-                cacheReleaseDate(nil, for: raw)
-                return nil
-            }
-
+        switch kind {
+        case .exact:
+            parsed = zonedTimestamp(raw)
+        case .localTime:
+            parsed = localTimestamp(raw, timeZone: timeZone)
+        case .dateOnly:
             var calendar = Calendar(identifier: .gregorian)
-            calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
-            var components = DateComponents()
-            components.year = parts[0]
-            components.month = parts[1]
-            components.day = parts[2]
-            parsed = calendar.date(from: components)
-        } else {
+            calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+            parsed = calendar.date(from: DateComponents(
+                year: Int(raw.prefix(4)), month: Int(raw.dropFirst(5).prefix(2)), day: Int(raw.suffix(2))
+            ))
+        case .invalid:
             parsed = nil
         }
-
-        cacheReleaseDate(parsed, for: raw)
+        cacheReleaseDate(parsed, for: cacheKey)
         return parsed
     }
 
-    private static func cacheReleaseDate(_ value: Date?, for raw: String) {
-        releaseDateCache[raw] = CachedReleaseDate(value: value)
-        releaseDateCacheOrder.append(raw)
+    private static func cacheReleaseDate(_ value: Date?, for key: String) {
+        releaseDateCache[key] = CachedReleaseDate(value: value)
+        releaseDateCacheOrder.append(key)
         if releaseDateCacheOrder.count > releaseDateCacheLimit {
             let evicted = releaseDateCacheOrder.removeFirst()
             releaseDateCache.removeValue(forKey: evicted)
         }
     }
 
-    /// Parses the calendar day portion at local midnight. This is used only for
-    /// the upcoming-season visibility window, which is date-based on Android.
     private static func calendarDayDate(for value: String?) -> Date? {
-        guard let day = isoDay(value) else { return nil }
-        let parts = day.split(separator: "-").compactMap { Int($0) }
-        guard parts.count == 3 else { return nil }
-        var components = DateComponents()
-        components.calendar = Calendar(identifier: .gregorian)
-        components.timeZone = TimeZone.current
-        components.year = parts[0]
-        components.month = parts[1]
-        components.day = parts[2]
-        return components.date
+        guard let day = localReleaseDay(value) else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        return calendar.date(from: DateComponents(
+            year: Int(day.prefix(4)), month: Int(day.dropFirst(5).prefix(2)), day: Int(day.suffix(2))
+        ))
+    }
+
+    /// Exact instants convert to the Apple TV's calendar day. Unknown-zone
+    /// timestamps and date-only values retain the provider's original day.
+    static func localReleaseDay(_ value: String?, timeZone: TimeZone = .current) -> String? {
+        guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let day = validatedCalendarDay(String(raw.prefix(10))) else { return nil }
+        switch precision(of: raw, timeZone: timeZone) {
+        case .dateOnly, .localTime:
+            return day
+        case .exact:
+            guard let instant = zonedTimestamp(raw) else { return nil }
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = timeZone
+            let parts = calendar.dateComponents([.year, .month, .day], from: instant)
+            guard let year = parts.year, let month = parts.month, let date = parts.day else { return nil }
+            return String(format: "%04d-%02d-%02d", year, month, date)
+        case .invalid:
+            return nil
+        }
     }
 
     private static func isoDay(_ value: String?) -> String? {
-        guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines),
-              raw.count >= 10 else { return nil }
-        let day = String(raw.prefix(10))
-        guard day.split(separator: "-").count == 3 else { return nil }
-        return day
+        localReleaseDay(value)
     }
 
     private static func todayIsoDay() -> String {
@@ -1800,6 +1920,9 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
     let streamUrl: String
     let position: Double
     let duration: Double
+    /// Percentage reported directly by a tracking provider, independently of
+    /// runtime. Nil for exact local positions and old persisted rows.
+    let explicitProgressPercent: Double?
     let lastWatchedAt: Date
     /// Which episode this progress belongs to (nil for movies and for entries
     /// saved before episode tracking existed — optionals keep old JSON decoding).
@@ -1843,7 +1966,7 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
     /// The episode guide travels with refreshed metadata. Prefer it over the
     /// stored enrichment override so an air-date correction is reflected without
     /// waiting for a progress record to be rebuilt.
-    private var effectiveEpisodeReleaseDate: String? { episodeVideo?.released ?? released }
+    var effectiveEpisodeReleaseDate: String? { EpisodeReleasePolicy.preferredRelease(primary: episodeVideo?.released, fallback: released) }
     var hasAired: Bool { EpisodeReleasePolicy.hasAired(effectiveEpisodeReleaseDate) }
     var isAiringToday: Bool { EpisodeReleasePolicy.isAiringToday(effectiveEpisodeReleaseDate) }
     var airDateText: String? { EpisodeReleasePolicy.airDateText(for: effectiveEpisodeReleaseDate) }
@@ -1912,12 +2035,16 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
         episodeOverviewOverride: String? = nil,
         episodeThumbnailOverride: String? = nil,
         isUpNext: Bool? = nil,
-        upNextSeedSeason: Int? = nil
+        upNextSeedSeason: Int? = nil,
+        explicitProgressPercent: Double? = nil
     ) {
         self.meta = meta
         self.streamUrl = streamUrl
         self.position = position
         self.duration = duration
+        self.explicitProgressPercent = explicitProgressPercent.flatMap {
+            $0.isFinite && (0...100).contains($0) ? $0 : nil
+        }
         self.lastWatchedAt = lastWatchedAt
         self.season = season
         self.episode = episode
@@ -1944,6 +2071,7 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
         streamUrl = try container.decode(String.self, forKey: .streamUrl)
         position = try container.decode(Double.self, forKey: .position)
         duration = try container.decode(Double.self, forKey: .duration)
+        explicitProgressPercent = try container.decodeIfPresent(Double.self, forKey: .explicitProgressPercent)
         lastWatchedAt = try container.decode(Date.self, forKey: .lastWatchedAt)
         season = try container.decodeIfPresent(Int.self, forKey: .season)
         episode = try container.decodeIfPresent(Int.self, forKey: .episode)
@@ -1967,6 +2095,7 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
         case streamUrl
         case position
         case duration
+        case explicitProgressPercent
         case lastWatchedAt
         case season
         case episode
@@ -2091,18 +2220,53 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
     }
 
     var progress: Double {
+        if let explicitProgressPercent, explicitProgressPercent.isFinite,
+           (0...100).contains(explicitProgressPercent) {
+            return explicitProgressPercent / 100
+        }
         guard duration > 0 else { return 0 }
         return min(max(position / duration, 0), 1)
     }
 
+    /// Only a real saved position is safe to hand to an external player. An
+    /// explicit Trakt percentage with unknown duration is not a timestamp.
     var resumePosition: Double {
-        max(0, min(position, max(duration - 5, 0)))
+        if duration <= 0, explicitProgressPercent != nil, position <= 0 { return 0 }
+        guard duration > 0 else { return max(0, position) }
+        return max(0, min(position, max(duration - 5, 0)))
+    }
+
+    /// Nil leaves an external player's own resume intact for percentage-only rows.
+    /// An explicit user restart is passed separately as zero by the caller.
+    var resumePositionIfKnown: Double? {
+        guard !isUpNextEntry, resumePosition > 0 else { return nil }
+        return resumePosition
+    }
+
+    /// Used only by the built-in player after it knows the actual stream length.
+    var resumeProgressFraction: Double? {
+        guard duration <= 0, position <= 0, let explicitProgressPercent,
+              explicitProgressPercent > 0, explicitProgressPercent < 90 else { return nil }
+        return explicitProgressPercent / 100
+    }
+
+    func resumeProgressFraction(season: Int?, episode: Int?) -> Double? {
+        guard !isUpNextEntry else { return nil }
+        if meta.isSeries {
+            guard let season, let episode, self.season == season, self.episode == episode else { return nil }
+        }
+        return resumeProgressFraction
     }
 
     var remainingText: String {
         // Synced rows can arrive without a runtime; there is no honest number to
         // show for those, so offer the action instead.
-        guard duration > 0 else { return L10n.string("action_resume", fallback: "Resume").uppercased() }
+        guard duration > 0 else {
+            if let explicitProgressPercent, explicitProgressPercent > 0 {
+                return "\(Int(explicitProgressPercent.rounded()))% watched"
+            }
+            return L10n.string("action_resume", fallback: "Resume").uppercased()
+        }
         let remaining = max(0, duration - position)
         let minutes = Int(remaining / 60)
         let hours = minutes / 60
@@ -2119,6 +2283,7 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
             && streamUrl == other.streamUrl
             && position == other.position
             && duration == other.duration
+            && explicitProgressPercent == other.explicitProgressPercent
             && lastWatchedAt == other.lastWatchedAt
             && season == other.season
             && episode == other.episode
@@ -2584,6 +2749,7 @@ enum ContinueWatchingStore {
         }
     }
 
+    @discardableResult
     static func save(
         meta: NuvioMeta,
         streamUrl: String,
@@ -2591,36 +2757,34 @@ enum ContinueWatchingStore {
         duration: Double,
         season: Int? = nil,
         episode: Int? = nil,
-        episodeId: String? = nil
-    ) {
-        // A temporarily unavailable MPV time-pos must not erase a valid resume
-        // point. Only a coherent, started sample is allowed to replace/remove
-        // existing progress.
+        episodeId: String? = nil,
+        requireVerifiedWrite: Bool = false
+    ) -> Bool {
+        // Duration 0 is a valid "unknown" value for external players and
+        // synced phone progress. Keep absolute seconds without fabricating a
+        // percent or treating the sample as complete.
         guard position.isFinite,
               duration.isFinite,
               position > 0,
-              duration >= 60 else {
+              duration == 0 || duration >= 60 else {
             print("[ContinueWatching][Store] save rejected: meta=\(meta.id), pos=\(position), dur=\(duration)")
-            return
+            return false
         }
 
-        // If an item for this title already exists and has the same episode, stream,
-        // and playback position within 1 second, the progress is unchanged.
         let existing = item(for: meta.id)
-        if let existing,
+        if !requireVerifiedWrite, let existing,
            existing.season == (season ?? existing.season),
            existing.episode == (episode ?? existing.episode),
            abs(existing.position - position) < 1.0,
            existing.streamUrl == streamUrl {
-            return
+            return true
         }
-
         print("[ContinueWatching][Store] save: meta=\(meta.id), S\(season.map(String.init) ?? "nil")E\(episode.map(String.init) ?? "nil"), pos=\(position)/\(duration)")
 
         // Record the raw row before any display rule runs. A finished episode is
         // not "nothing to store" — it is precisely the seed that produces the
         // next episode's Next Up card, here and on every other device.
-        WatchProgressLedger.upsert(
+        guard WatchProgressLedger.upsert(
             WatchProgressRecord(
                 progressKey: WatchProgressLedger.progressKey(
                     contentId: meta.id,
@@ -2641,7 +2805,7 @@ enum ContinueWatchingStore {
                 lastWatchedAt: Date(),
                 isPendingPush: true
             )
-        )
+        ) else { return false }
 
         guard shouldKeep(position: position, duration: duration) else {
             print("[ContinueWatching][Store] save: shouldKeep=false (pos=\(position)/dur=\(duration) >= \(WatchProgressLedger.completionFraction)) -> removing from store")
@@ -2649,11 +2813,11 @@ enum ContinueWatchingStore {
                 removeEpisodeResumePoint(meta: meta, season: season, episode: episode)
             }
             remove(metaId: meta.id, retainingLedger: true)
-            return
+            return true
         }
 
         if meta.isSeries, let season, let episode {
-            saveEpisodeResumePoint(
+            guard saveEpisodeResumePoint(
                 meta: meta,
                 season: season,
                 episode: episode,
@@ -2661,7 +2825,7 @@ enum ContinueWatchingStore {
                 position: position,
                 duration: duration,
                 updatedAt: Date()
-            )
+            ) else { return false }
         }
 
         // A save that doesn't know its episode (resume paths that only carry a
@@ -2678,7 +2842,7 @@ enum ContinueWatchingStore {
         )
         let updated = ([item] + items().filter { $0.meta.id != meta.id }).prefix(maxItems)
         print("[ContinueWatching][Store] save: persisting \(updated.count) items in store")
-        persist(Array(updated))
+        return persist(Array(updated))
     }
 
     /// Records a genuine watch-through.
@@ -2688,16 +2852,17 @@ enum ContinueWatchingStore {
     /// here and on every other device. Position-at-runtime is how the phone
     /// marks a finished row, and it is the only completion signal the sync
     /// payload can carry — there is no `is_completed` column on the wire.
+    @discardableResult
     static func markPlaybackCompleted(
         meta: NuvioMeta,
         duration: Double,
         season: Int? = nil,
         episode: Int? = nil
-    ) {
-        guard duration.isFinite, duration > 0 else { return }
+    ) -> Bool {
+        guard duration.isFinite, duration > 0 else { return false }
         print("[ContinueWatching][Store] markPlaybackCompleted: meta=\(meta.id), S\(season.map(String.init) ?? "nil")E\(episode.map(String.init) ?? "nil"), dur=\(duration)")
         ContinueWatchingDismissStore.clear(contentId: meta.id)
-        WatchProgressLedger.upsert(
+        guard WatchProgressLedger.upsert(
             WatchProgressRecord(
                 progressKey: WatchProgressLedger.progressKey(
                     contentId: meta.id,
@@ -2718,11 +2883,12 @@ enum ContinueWatchingStore {
                 lastWatchedAt: Date(),
                 isPendingPush: true
             )
-        )
+        ) else { return false }
         if let season, let episode {
             removeEpisodeResumePoint(meta: meta, season: season, episode: episode)
         }
         remove(metaId: meta.id, retainingLedger: true)
+        return true
     }
 
     /// Display-only "Next Up" suggestion. Deliberately absent from the ledger: a
@@ -2810,7 +2976,7 @@ enum ContinueWatchingStore {
                         lastWatchedAt: entry.item.lastWatchedAt,
                         season: entry.item.season,
                         episode: entry.item.episode,
-                        released: latestEpisode?.released ?? entry.item.released,
+                        released: EpisodeReleasePolicy.preferredRelease(primary: latestEpisode?.released, fallback: entry.item.released),
                         episodeTitleOverride: entry.item.episodeTitleOverride,
                         episodeOverviewOverride: entry.item.episodeOverviewOverride,
                         episodeThumbnailOverride: entry.item.episodeThumbnailOverride,
@@ -3022,13 +3188,15 @@ enum ContinueWatchingStore {
         return legacy
     }
 
-    private static func persistEpisodeResumePoints(_ points: [EpisodeResumePoint]) {
-        guard let data = try? makeEncoder().encode(points) else { return }
-        if LargePayloadStore.write(data, key: episodeResumeStorageKey, directory: episodeResumeDirectoryName) {
-            UserDefaults.standard.removeObject(forKey: episodeResumeStorageKey)
-        }
+    @discardableResult
+    private static func persistEpisodeResumePoints(_ points: [EpisodeResumePoint]) -> Bool {
+        guard let data = try? makeEncoder().encode(points) else { return false }
+        guard LargePayloadStore.write(data, key: episodeResumeStorageKey, directory: episodeResumeDirectoryName) else { return false }
+        UserDefaults.standard.removeObject(forKey: episodeResumeStorageKey)
+        return true
     }
 
+    @discardableResult
     private static func saveEpisodeResumePoint(
         meta: NuvioMeta,
         season: Int,
@@ -3037,17 +3205,17 @@ enum ContinueWatchingStore {
         position: Double,
         duration: Double,
         updatedAt: Date
-    ) {
-        guard position > 5 else { return }
+    ) -> Bool {
+        guard position > 5 else { return true }
         guard shouldKeep(position: position, duration: duration) else {
             removeEpisodeResumePoint(meta: meta, season: season, episode: episode)
-            return
+            return false
         }
         let current = episodeResumePoints()
         if let existing = current.first(where: {
             resumePoint($0, matches: meta, season: season, episode: episode, episodeId: episodeId)
         }), existing.updatedAt > updatedAt {
-            return
+            return false
         }
         let point = EpisodeResumePoint(
             metaId: meta.id,
@@ -3063,7 +3231,7 @@ enum ContinueWatchingStore {
         let updated = ([point] + current.filter {
             !resumePoint($0, matches: meta, season: season, episode: episode, episodeId: episodeId)
         }).prefix(maxEpisodeResumePoints)
-        persistEpisodeResumePoints(Array(updated))
+        return persistEpisodeResumePoints(Array(updated))
     }
 
     private static func removeEpisodeResumePoint(meta: NuvioMeta, season: Int, episode: Int) {
@@ -7679,7 +7847,8 @@ enum WatchedStore {
         episode: Int? = nil,
         completionID: String,
         source capturedSource: TraktWatchProgressSource? = nil,
-        completionAccounts: [String: String]? = nil
+        completionAccounts: [String: String]? = nil,
+        externallyReportedProviders: Set<TraktWatchProgressSource> = []
     ) -> Bool {
         let completionID = completionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !completionID.isEmpty else { return false }
@@ -7729,7 +7898,7 @@ enum WatchedStore {
         lastIDsBySource[sourceKey] = completionID
         let watchedAt = Date()
         var pendingCompletions = existing?.pendingPlaybackCompletions ?? []
-        for target in completionTargets {
+        for target in completionTargets where !externallyReportedProviders.contains(target.provider) {
             let event = WatchedPlaybackCompletionUpload(
                 completionID: completionID,
                 provider: target.provider,
@@ -7842,7 +8011,9 @@ enum WatchedStore {
         ContinueWatchingStore.markLedgerWatched(meta: meta, season: item.season, episode: item.episode)
         ContinueWatchingStore.removeWatched([item])
         let markedAt = item.watchedAt
+        let markedProfileID = activeProfileId
         Task { @MainActor in
+            guard activeProfileId == markedProfileID, ProfileSettings.activeProfileID == markedProfileID else { return }
             TraktProgressService.forgetLocalPlayback(
                 meta: meta,
                 season: item.season,
@@ -7882,7 +8053,7 @@ enum WatchedStore {
                     episode: item.episode,
                     isWatched: true,
                     store: traktStore,
-                    profileScope: activeProfileId
+                    profileScope: profileId
                 )
             }
         }
@@ -7924,7 +8095,9 @@ enum WatchedStore {
         ContinueWatchingStore.markLedgerWatched(meta: meta, season: season, episode: episode)
         ContinueWatchingStore.removeWatched([item])
         let markedAt = item.watchedAt
+        let markedProfileID = activeProfileId
         Task { @MainActor in
+            guard activeProfileId == markedProfileID, ProfileSettings.activeProfileID == markedProfileID else { return }
             TraktProgressService.forgetLocalPlayback(
                 meta: meta,
                 season: season,

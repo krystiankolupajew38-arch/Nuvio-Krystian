@@ -159,6 +159,8 @@ final class NuvioSyncManager: ObservableObject {
     var pendingPushScopes: SyncPushScope = []
     var isPushExecuting = false
     private var observers: [NSObjectProtocol] = []
+    var isHomePullPending: Bool { pullTask != nil }
+
     private var pullTask: Task<Void, Never>?
     private var pushTask: Task<Void, Never>?
     private var pushTaskDeadline: Date?

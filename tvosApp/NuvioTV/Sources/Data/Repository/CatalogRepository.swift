@@ -7,6 +7,16 @@
 
 import Foundation
 
+/// A faster low-priority metadata response cannot beat a still-pending higher
+/// priority manifest. Kept pure so out-of-order completions can be tested.
+enum OrderedMetadataSelection {
+    static func winningIndex(successful: Set<Int>, pending: Set<Int>) -> Int? {
+        guard let first = successful.min(),
+              !pending.contains(where: { $0 < first }) else { return nil }
+        return first
+    }
+}
+
 /// Repository protocol for catalog operations
 protocol CatalogRepository {
     /// Get catalogs for home screen
@@ -351,7 +361,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         let flags = [SettingsKey.tmdbEnabled, SettingsKey.tmdbUseBasicInfo, SettingsKey.tmdbUseArtwork]
             .map { "\($0)=\(store.object(forKey: $0) as? Bool ?? ($0 != SettingsKey.tmdbEnabled))" }
             .joined(separator: ",")
-        return "\(ProfileSettings.activeProfileID ?? "default")|\(TmdbMetadataLanguage.resolvedLanguage(in: store))|\(flags)"
+        return "\(ProfileSettings.activeProfileID ?? "default")|\(TmdbMetadataLanguage.resolvedLanguage(in: store))|\(flags)|addons:\(store.string(forKey: SettingsKey.streamAddonManifestStates) ?? store.string(forKey: SettingsKey.streamAddonManifestURLs) ?? "")|cinemeta:\(Self.isCinemetaEnabled(in: store))"
     }
 
     // Called only while holding the metadata cache's barrier.
@@ -1054,40 +1064,72 @@ final class CinemetaCatalogRepository: CatalogRepository {
             typesToTry = [type, metaType]
         }
 
-        // 1. Query configured metadata add-ons concurrently if any exist
-        var addonURLs: [(url: URL, candidateType: String)] = []
-        for candidateType in typesToTry {
+        // Configured metadata add-ons have an explicit user-controlled order.
+        // Fetch concurrently for latency, but accept the first successful result
+        // IN THAT ORDER, never the fastest network response (Mobile/Desktop).
+        // Built-in Cinemeta is only a fallback when the user enabled it.
+        var addonRequests: [(url: URL, candidateType: String, order: Int, typeOrder: Int)] = []
+        let configuredOrder = Self.configuredStreamAddonManifestURLs
+        for (typeIndex, candidateType) in typesToTry.enumerated() {
             let addons = await configuredAddons(supporting: "meta", type: candidateType, id: resolvedId)
             for addon in addons {
-                if let metaURL = addon.metaURL(type: candidateType, id: resolvedId) {
-                    addonURLs.append((metaURL, candidateType))
+                if let metaURL = addon.metaURL(type: candidateType, id: resolvedId),
+                   let priority = configuredOrder.firstIndex(of: addon.manifestURL) {
+                    addonRequests.append((metaURL, candidateType, priority, typeIndex))
                 }
             }
         }
+        // Metadata provider order takes precedence over type fallback order.
+        // For a single provider, try the caller's type before an inferred type.
+        addonRequests.sort { lhs, rhs in
+            lhs.order == rhs.order ? lhs.typeOrder < rhs.typeOrder : lhs.order < rhs.order
+        }
 
-        if !addonURLs.isEmpty {
-            let addonResult: NuvioMeta? = await withTaskGroup(of: NuvioMeta?.self) { group in
-                for (metaURL, candidateType) in addonURLs {
+        if !addonRequests.isEmpty {
+            let preferred: (index: Int, meta: NuvioMeta)? = await withTaskGroup(
+                of: (Int, NuvioMeta?).self
+            ) { group in
+                for (index, request) in addonRequests.enumerated() {
                     group.addTask { [self] in
                         do {
-                            let response: CinemetaMetaResponse = try await self.fetch(metaURL)
-                            let meta = await TmdbDetailsService.localizedMetadata(
-                                for: response.meta.toMeta(fallbackType: candidateType)
-                            )
-                            return meta
+                            let response: CinemetaMetaResponse = try await self.fetch(request.url)
+                            let meta = response.meta.toMeta(fallbackType: request.candidateType)
+                            return (index, meta)
                         } catch {
-                            return nil
+                            return (index, nil)
                         }
                     }
                 }
-                for await result in group {
-                    if let result {
-                        return result
+
+                var pending = Set(addonRequests.indices)
+                var successful: [Int: NuvioMeta] = [:]
+                for await (index, meta) in group {
+                    pending.remove(index)
+                    if let meta { successful[index] = meta }
+                    // Do not wait for lower-priority providers once all requests
+                    // ahead of the chosen source have conclusively failed.
+                    if let first = OrderedMetadataSelection.winningIndex(
+                        successful: Set(successful.keys), pending: pending
+                    ), let winner = successful[first] {
+                        group.cancelAll()
+                        return (first, winner)
                     }
                 }
                 return nil
             }
-            if let addonResult {
+            if let preferred {
+                let chosen = addonRequests[preferred.index]
+                // The enabled manifest index identifies the provider without
+                // accidentally printing a credential-bearing manifest name/URL.
+                // Diagnostics are opt-in, derived from fetched results only.
+                if ProfileSettings.current.bool(forKey: SettingsKey.releaseDateDiagnostics) {
+                    for video in (preferred.meta.videos ?? []) {
+                        let kind = EpisodeReleasePolicy.precision(of: video.released).rawValue
+                        let day = EpisodeReleasePolicy.localReleaseDay(video.released) ?? "unknown"
+                        print("[ReleaseMetadata] configuredProvider=\(chosen.order + 1) season=\(video.season) episode=\(video.episode) precision=\(kind) localDay=\(day) reason=highest-priority-success")
+                    }
+                }
+                let addonResult = await TmdbDetailsService.localizedMetadata(for: preferred.meta)
                 cacheMetadata(addonResult, requestedID: id, context: metadataContext)
                 return addonResult
             }

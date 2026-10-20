@@ -31,6 +31,17 @@ enum ContinueWatchingBuilder {
     private static var rebuildTask: Task<Void, Never>?
     private static var generation: UInt = 0
 
+    static var isRebuildPending: Bool {
+        lock.withLock { rebuildTask != nil }
+    }
+
+    private static func finishScheduledRebuild(_ expectedGeneration: UInt) {
+        lock.withLock {
+            guard generation == expectedGeneration else { return }
+            rebuildTask = nil
+        }
+    }
+
     private static func nextGeneration() -> UInt {
         lock.lock()
         defer { lock.unlock() }
@@ -192,6 +203,7 @@ enum ContinueWatchingBuilder {
         generation &+= 1
         let gen = generation
         let task = Task.detached(priority: .utility) {
+            defer { finishScheduledRebuild(gen) }
             if delayMs > 0 {
                 try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
             }
@@ -691,6 +703,27 @@ enum ContinueWatchingBuilder {
             let existing = spec.existing
             let record = spec.entry.record
 
+            if ProfileSettings.current.bool(forKey: SettingsKey.releaseDateDiagnostics) {
+                let original = spec.video?.released
+                let previous = spec.isSeed || existing?.season != record.season || existing?.episode != record.episode
+                    ? nil : existing?.released
+                let metadataChoice = EpisodeReleasePolicy.preferredRelease(
+                    primary: original, fallback: previous
+                )
+                let chosen = EpisodeReleasePolicy.preferredRelease(
+                    primary: metadataChoice, fallback: tmdbEpisode?.released
+                )
+                let source = chosen == original && chosen != nil ? "configured-metadata"
+                    : chosen == previous && chosen != nil ? "previous-valid-release"
+                    : chosen == tmdbEpisode?.released && chosen != nil ? "TMDB-fallback"
+                    : "unknown"
+                let precision = EpisodeReleasePolicy.precision(of: chosen).rawValue
+                let originalPrecision = EpisodeReleasePolicy.precision(of: original).rawValue
+                let tmdbPrecision = EpisodeReleasePolicy.precision(of: tmdbEpisode?.released).rawValue
+                let localDay = EpisodeReleasePolicy.localReleaseDay(chosen) ?? "unknown"
+                print("[ReleaseSelection] season=\(spec.season ?? -1) episode=\(spec.episode ?? -1) source=\(source) precision=\(precision) localDay=\(localDay) originalPrecision=\(originalPrecision) tmdbPrecision=\(tmdbPrecision) reason=more-precise-first-then-provider-priority")
+            }
+
             if spec.isSeed {
                 guard let season = spec.season, let ep = spec.episode, let next = spec.video else {
                     if let existing, existing.isUpNextEntry { page.append(existing) }
@@ -705,7 +738,7 @@ enum ContinueWatchingBuilder {
                         lastWatchedAt: record.lastWatchedAt,
                         season: season,
                         episode: ep,
-                        released: tmdbEpisode?.released ?? next.released,
+                        released: EpisodeReleasePolicy.preferredRelease(primary: next.released, fallback: tmdbEpisode?.released),
                         episodeTitleOverride: tmdbEpisode?.title ?? nonPlaceholder(next.title),
                         episodeOverviewOverride: tmdbEpisode?.overview ?? nonEmpty(next.overview),
                         episodeThumbnailOverride: tmdbEpisode?.thumbnail ?? next.thumbnail,
@@ -716,6 +749,13 @@ enum ContinueWatchingBuilder {
             } else {
                 let sameEpisode = existing?.season == record.season && existing?.episode == record.episode
                 let video = spec.video
+                let selectedRelease = EpisodeReleasePolicy.preferredRelease(
+                    primary: EpisodeReleasePolicy.preferredRelease(
+                        primary: video?.released,
+                        fallback: sameEpisode ? existing?.released : nil
+                    ),
+                    fallback: tmdbEpisode?.released
+                )
                 page.append(
                     ContinueWatchingItem(
                         meta: meta,
@@ -725,7 +765,7 @@ enum ContinueWatchingBuilder {
                         lastWatchedAt: record.lastWatchedAt,
                         season: record.season,
                         episode: record.episode,
-                        released: tmdbEpisode?.released ?? video?.released ?? (sameEpisode ? existing?.released : nil),
+                        released: selectedRelease,
                         episodeTitleOverride: tmdbEpisode?.title
                             ?? nonPlaceholder(video?.title)
                             ?? (sameEpisode ? existing?.episodeTitleOverride : nil),

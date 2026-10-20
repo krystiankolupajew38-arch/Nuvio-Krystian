@@ -190,6 +190,7 @@ struct PosterCard: View {
     /// for a genuinely fresh drop) and the progress bar is hidden, since there's
     /// no real playback position yet.
     var continueIsUpNext: Bool = false
+    var continueEpisodeIsWatched: Bool = false
     var continueUpNextBadgeText: String? = nil
     var collectionOrigin: CollectionOriginPresentation? = nil
     var showsWatchedBadge: Bool = true
@@ -232,6 +233,7 @@ struct PosterCard: View {
     private let landscapeTransitionDuration: TimeInterval = 0.3
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
+    @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
     @State private var loadedCustomLandscapeArtworkURL: String?
 
     #if os(tvOS)
@@ -392,6 +394,10 @@ struct PosterCard: View {
                 placeholderView
             }
             .frame(width: cardWidth, height: cardHeight)
+            // Only the actual episode still is spoiler art; never blur a
+            // series poster, generic backdrop, title, progress or focus ring.
+            .blur(radius: shouldBlurEpisodeStill ? 18 : 0, opaque: true)
+            .clipped()
             #if os(tvOS)
             // Cross-fade the landscape artwork away only once the resolved
             // trailer is ready to draw, avoiding a black frame on slow links.
@@ -818,6 +824,19 @@ struct PosterCard: View {
         return customPortraitArtworkURL ?? meta.posterUrl
     }
 
+    private var shouldBlurEpisodeStill: Bool {
+        guard let still = continueEpisodeArtworkURL?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return false
+        }
+        return EpisodeSpoilerPolicy.shouldBlur(
+            enabled: blurUnwatchedEpisodes,
+            isWatched: continueEpisodeIsWatched,
+            hasEpisodeArtwork: !still.isEmpty,
+            displaysEpisodeArtwork: isContinueOrUpcomingCard && effectiveLandscape
+                && continueEpisodeText != nil && imageUrl == still
+        )
+    }
+
     private var landscapePreloadURL: String? {
         landscapePreloadArmed || isLandscape || isEffectivelyAlwaysLandscape ? landscapeArtworkURL : nil
     }
@@ -1000,6 +1019,7 @@ extension PosterCard: Equatable {
             && lhs.continueEpisodeTitleText == rhs.continueEpisodeTitleText
             && lhs.continueEpisodeArtworkURL == rhs.continueEpisodeArtworkURL
             && lhs.continueIsUpNext == rhs.continueIsUpNext
+            && lhs.continueEpisodeIsWatched == rhs.continueEpisodeIsWatched
             && lhs.continueUpNextBadgeText == rhs.continueUpNextBadgeText
             && lhs.showsWatchedBadge == rhs.showsWatchedBadge
             && lhs.shouldRequestInitialFocus == rhs.shouldRequestInitialFocus

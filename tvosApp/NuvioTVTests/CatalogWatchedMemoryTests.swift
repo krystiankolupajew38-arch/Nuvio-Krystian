@@ -118,3 +118,49 @@ private final class WatchedMetadataGate {
         continuation = nil
     }
 }
+
+
+final class EpisodeReleaseTimezoneTests: XCTestCase {
+    func testZonedTimestampUsesViewerCalendarDay() {
+        let release = "2026-10-21T20:30:00-04:00"
+        XCTAssertEqual(
+            EpisodeReleasePolicy.localReleaseDay(release, timeZone: TimeZone(identifier: "Europe/London")!),
+            "2026-10-22"
+        )
+        XCTAssertEqual(
+            EpisodeReleasePolicy.localReleaseDay(release, timeZone: TimeZone(identifier: "America/New_York")!),
+            "2026-10-21"
+        )
+        XCTAssertEqual(
+            EpisodeReleasePolicy.localReleaseDay(release, timeZone: TimeZone(identifier: "Asia/Tokyo")!),
+            "2026-10-22"
+        )
+    }
+
+    func testPlainDateRemainsProviderDateInEveryRegion() {
+        for zone in ["Europe/London", "America/Los_Angeles", "Australia/Sydney"] {
+            XCTAssertEqual(
+                EpisodeReleasePolicy.localReleaseDay("2026-10-21", timeZone: TimeZone(identifier: zone)!),
+                "2026-10-21"
+            )
+        }
+    }
+
+    func testUTCReleaseCanFallOnPreviousLocalDay() {
+        XCTAssertEqual(
+            EpisodeReleasePolicy.localReleaseDay("2026-12-01T00:30:00Z", timeZone: TimeZone(identifier: "America/Los_Angeles")!),
+            "2026-11-30"
+        )
+    }
+
+    func testTimezoneLessReleaseKeepsCalendarDate() {
+        XCTAssertEqual(
+            EpisodeReleasePolicy.localReleaseDay("2026-10-21T20:30:00", timeZone: TimeZone(identifier: "Europe/London")!),
+            "2026-10-21"
+        )
+    }
+
+    func testInvalidCalendarDateRejected() {
+        XCTAssertNil(EpisodeReleasePolicy.localReleaseDay("2026-02-30"))
+    }
+}

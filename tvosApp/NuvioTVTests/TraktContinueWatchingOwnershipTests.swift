@@ -158,3 +158,15 @@ final class TraktContinueWatchingOwnershipTests: XCTestCase {
         TraktProgressService.currentContinueWatchingItem(for: meta, source: .trakt)
     }
 }
+
+extension TraktContinueWatchingOwnershipTests {
+    @MainActor
+    func testDelayedProviderResponsePreservesNewerUnsynchronisedCheckpoint() {
+        let context = capture()
+        seedCheckpoint()
+        let stale = item(meta: checkpointMeta, position: 100, date: Date(timeIntervalSince1970: 1))
+        let result = TraktProgressService.finalizeContinueWatchingFetch([stale], context: context)
+        XCTAssertEqual(result?.first?.position, 300)
+        XCTAssertEqual(current(checkpointMeta)?.position, 300)
+    }
+}
