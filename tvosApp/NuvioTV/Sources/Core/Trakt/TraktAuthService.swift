@@ -1335,7 +1335,7 @@ struct TraktProgressService {
         guard position.isFinite,
               duration.isFinite,
               position > 0,
-              duration > 0 else { return false }
+              duration >= 0 else { return false }
 
         let profileId = ContinueWatchingStore.activeProfileId
         let source = sourceOverride ?? TraktSettingsStore.watchProgressSource
@@ -1351,8 +1351,10 @@ struct TraktProgressService {
                 && WatchedStore.sameContent($0.item.meta, meta)
         }
 
-        let progressPercent = position / duration * 100
-        if progressPercent < completionPercent {
+        // Unknown duration is always incomplete. Preserve the absolute
+        // position in the checkpoint until an authoritative duration arrives.
+        let isCompleted = duration > 0 && (position / duration * 100) >= completionPercent
+        if !isCompleted {
             let video = meta.videos?.first {
                 $0.season == season && $0.episode == episode
             }
@@ -1733,7 +1735,6 @@ struct TraktProgressService {
                 let remote = merged[index]
                 let sameEpisode = remote.season == local.season && remote.episode == local.episode
                 if sameEpisode {
-                    let localProgress = local.duration > 0 ? (local.position / local.duration) : 0
                     let remoteProgress = remote.duration > 0 ? (remote.position / remote.duration) : 0
                     let remoteIsSubstantiallyNewer = remote.lastWatchedAt > local.lastWatchedAt.addingTimeInterval(30)
                     // Timestamp and episode identity determine whether this is
