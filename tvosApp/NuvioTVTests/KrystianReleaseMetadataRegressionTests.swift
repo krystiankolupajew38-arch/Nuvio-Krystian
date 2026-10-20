@@ -3,6 +3,7 @@ import XCTest
 @testable import NuvioTV
 
 /// Pure policies only: no network calls, device pairing or third-party credentials.
+@MainActor
 final class KrystianReleaseMetadataRegressionTests: XCTestCase {
     private let london = TimeZone(identifier: "Europe/London")!
     private let eastern = TimeZone(identifier: "America/New_York")!
