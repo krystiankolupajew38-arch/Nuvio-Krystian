@@ -21,6 +21,14 @@ if [ -z "$arch" ]; then
 fi
 
 source_root="${SRCROOT}/../Vendor/FFmpegBuild/Sources"
+
+# Synced source folders can attach Finder metadata to framework bundles.
+# Remove only code-signing-incompatible metadata from generated copies.
+clear_finder_metadata() {
+    /usr/bin/xattr -dr com.apple.FinderInfo "$1" 2>/dev/null || true
+    /usr/bin/xattr -dr com.apple.ResourceFork "$1" 2>/dev/null || true
+}
+
 app_frameworks_dir=""
 if [ -n "${FRAMEWORKS_FOLDER_PATH:-}" ]; then
     app_frameworks_dir="${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}"
@@ -43,6 +51,7 @@ for xcframework in "${source_root}"/AetherLib*.xcframework; do
     if [ -d "$package_framework" ]; then
         target_binary="${package_framework}/${framework_name}"
         /usr/bin/lipo -thin "$arch" "$source_binary" -output "$target_binary"
+        clear_finder_metadata "$package_framework"
         /usr/bin/codesign --force --sign - --timestamp=none "$target_binary"
         /usr/bin/codesign --force --sign - --timestamp=none "$package_framework"
     fi
@@ -55,11 +64,12 @@ for xcframework in "${source_root}"/AetherLib*.xcframework; do
     app_framework="${app_frameworks_dir}/${framework_name}.framework"
     mkdir -p "$app_frameworks_dir"
     if [ ! -d "$app_framework" ]; then
-        /usr/bin/ditto "$source_framework" "$app_framework"
+        /usr/bin/ditto --norsrc --noextattr "$source_framework" "$app_framework"
     fi
 
     target_binary="${app_framework}/${framework_name}"
     /usr/bin/lipo -thin "$arch" "$source_binary" -output "$target_binary"
+    clear_finder_metadata "$app_framework"
     /usr/bin/codesign --force --sign - --timestamp=none "$target_binary"
     /usr/bin/codesign --force --sign - --timestamp=none "$app_framework"
 done

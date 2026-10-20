@@ -2921,6 +2921,15 @@ enum StreamPickerListBuilder {
     /// Default page batch size for lazy-loading stream lists.
     static let defaultPageSize = 20
 
+    /// Expand only when the remote reaches the end of the current page.
+    /// Lazy stacks may pre-appear offscreen rows, so onAppear is not a scroll signal.
+    static func limitAfterFocus(_ id: String?, streams: [NuvioStream], currentLimit: Int) -> Int {
+        guard let id, currentLimit < streams.count,
+              let index = streams.prefix(currentLimit).firstIndex(where: { $0.id == id }),
+              index >= currentLimit - 4 else { return currentLimit }
+        return min(currentLimit + defaultPageSize, streams.count)
+    }
+
     /// Pure pagination slice helper.
     static func paginatedSlice(
         streams: [NuvioStream],
@@ -3187,6 +3196,21 @@ struct StreamPickerListCacheKey: Equatable {
     let includeDebrid: Bool
     var cachedOnly: Bool = false
     var preserveAddonStreams: Bool = false
+}
+
+/// Serial background executor for regex-heavy filtering and sort-key derivation.
+/// SwiftUI tasks discard cancelled/superseded results before publishing them.
+actor StreamPickerListWorker {
+    static let shared = StreamPickerListWorker()
+
+    func build(streams: [NuvioStream], groups: [AddonStreamGroup], key: StreamPickerListCacheKey) -> [NuvioStream] {
+        guard !Task.isCancelled else { return [] }
+        return StreamPickerListBuilder.displayedStreams(
+            streams: streams, groups: groups, selectedAddonId: key.selectedAddonId,
+            sortOption: key.sortOption, includeDebrid: key.includeDebrid,
+            cachedOnly: key.cachedOnly, preserveAddonStreams: key.preserveAddonStreams
+        )
+    }
 }
 
 private enum TvDetailsFocusSection: Hashable {
@@ -7806,6 +7830,7 @@ private struct TvStreamPickerOverlay: View {
 
     private let filterAllKey = "filter::all"
     private let sortKey = "filter::sort"
+    private let refreshKey = "filter::refresh"
     private let cachedKey = "filter::cached"
     private func filterKey(_ addonId: String) -> String { "filter::\(addonId)" }
 
@@ -7926,7 +7951,6 @@ private struct TvStreamPickerOverlay: View {
             .onAppear {
                 pickerIsVisible = true
                 pickerProfileID = ProfileSettings.activeProfileID
-                refreshDisplayedStreamsIfNeeded()
                 seedInitialFocus()
                 if !didPresentInitialAvailabilityMessage {
                     didPresentInitialAvailabilityMessage = true
@@ -7935,9 +7959,8 @@ private struct TvStreamPickerOverlay: View {
             }
             // Progressive add-on results, filter chips, sort, and debrid toggle
             // all flow through this cache key. Focus is excluded.
-            .onChange(of: listCacheKey) { _, _ in
-                refreshDisplayedStreamsIfNeeded()
-                seedStreamFocusIfNeeded()
+            .task(id: listCacheKey, priority: .userInitiated) {
+                await refreshDisplayedStreamsIfNeeded()
             }
             .onChange(of: isLoading) { _, loading in
                 if !loading {
@@ -7958,6 +7981,9 @@ private struct TvStreamPickerOverlay: View {
             // snaps focus back to the first stream (the reported bug), so we
             // debounce and bail when focus has already landed somewhere.
             .onChange(of: focusedItem) { _, newValue in
+                visibleStreamLimit = StreamPickerListBuilder.limitAfterFocus(
+                    newValue, streams: displayedStreams, currentLimit: visibleStreamLimit
+                )
                 if let newValue, newValue != filterAllKey, !didSeedStreamFocus {
                     didSeedStreamFocus = true
                 }
@@ -7973,7 +7999,10 @@ private struct TvStreamPickerOverlay: View {
                 streamBadgeSettings = StreamBadgeSettingsStore.snapshot
                 streamBadgeSettingsRevision &+= 1
             }
-            .onDisappear { pickerIsVisible = false }
+            .onDisappear {
+                pickerIsVisible = false
+                refreshToastTask?.cancel()
+            }
             .onExitCommand(perform: onDismiss)
         }
         .background(Color.black.ignoresSafeArea())
@@ -8022,14 +8051,6 @@ private struct TvStreamPickerOverlay: View {
         )
     }
 
-    private func loadMoreStreams() {
-        guard visibleStreamLimit < activeDisplayedStreams.count else { return }
-        visibleStreamLimit = min(
-            visibleStreamLimit + StreamPickerListBuilder.defaultPageSize,
-            activeDisplayedStreams.count
-        )
-    }
-
     private func select(_ stream: NuvioStream, player: ExternalPlayer?) {
         guard let reason = stream.unavailabilityReason else {
             onSelect(stream, player)
@@ -8039,22 +8060,29 @@ private struct TvStreamPickerOverlay: View {
     }
 
     /// Rebuilds the cached list only when derivation inputs actually change.
-    private func refreshDisplayedStreamsIfNeeded() {
+    @MainActor
+    private func refreshDisplayedStreamsIfNeeded() async {
         let key = listCacheKey
         guard key != displayedStreamsCacheKey else { return }
-        let refreshedStreams = StreamPickerListBuilder.displayedStreams(
-            streams: streams,
-            groups: groups,
-            selectedAddonId: selectedAddonId,
-            sortOption: sortOption,
-            includeDebrid: includeDebrid,
-            cachedOnly: effectiveCachedOnly,
-            preserveAddonStreams: preserveAddonOrder
+        let refreshedStreams = await StreamPickerListWorker.shared.build(
+            streams: streams, groups: groups, key: key
         )
+        guard !Task.isCancelled, key == listCacheKey, pickerIsVisible else { return }
+        let sameFilter = displayedStreamsCacheKey.map { previous in
+            previous.selectedAddonId == key.selectedAddonId
+                && previous.sortOption == key.sortOption
+                && previous.includeDebrid == key.includeDebrid
+                && previous.cachedOnly == key.cachedOnly
+                && previous.preserveAddonStreams == key.preserveAddonStreams
+        } ?? false
         displayedStreams = refreshedStreams
         displayedStreamsCacheKey = key
         let focusedIndex = focusedItem.flatMap { id in refreshedStreams.firstIndex { $0.id == id } }
-        visibleStreamLimit = max(StreamPickerListBuilder.defaultPageSize, (focusedIndex ?? -1) + 1)
+        visibleStreamLimit = max(
+            sameFilter ? visibleStreamLimit : StreamPickerListBuilder.defaultPageSize,
+            (focusedIndex ?? -1) + 1
+        )
+        seedStreamFocusIfNeeded()
     }
 
     @MainActor
@@ -8235,6 +8263,19 @@ private struct TvStreamPickerOverlay: View {
                 .fixedSize(horizontal: true, vertical: false)
             }
 
+            if onRefresh != nil {
+                TvStreamFilterButton(
+                    title: L10n.string("action_refresh", fallback: "Refresh"),
+                    isSelected: false,
+                    focusBinding: $focusedItem,
+                    focusValue: refreshKey,
+                    action: { performRefresh() }
+                )
+                .disabled(isResolvingDebrid || isRefreshing)
+                .accessibilityIdentifier("streams.refresh")
+                .fixedSize(horizontal: true, vertical: false)
+            }
+
             // Sort remains pinned to the trailing edge instead of moving with
             // the add-on scroller.
             TvStreamFilterButton(
@@ -8266,7 +8307,7 @@ private struct TvStreamPickerOverlay: View {
         let badgeSettings = streamBadgeSettings
         let hasMore = totalCount > streamsToShow.count
         return ZStack {
-            if isLoading && streamsToShow.isEmpty && selectedGroupError == nil {
+            if (isLoading || displayedStreamsCacheKey != listCacheKey) && streamsToShow.isEmpty && selectedGroupError == nil {
                 VStack(spacing: 24) {
                     ProgressView()
                         .progressViewStyle(CircularProgressViewStyle(tint: .white))
@@ -8321,13 +8362,6 @@ private struct TvStreamPickerOverlay: View {
                                     onSelectPlayer: { player in select(stream, player: player) }
                                 )
                                 .id(stream.id)
-                                .onAppear {
-                                    if let index = streamsToShow.firstIndex(where: { $0.id == stream.id }),
-                                       index >= streamsToShow.count - 4,
-                                       hasMore {
-                                        loadMoreStreams()
-                                    }
-                                }
                             }
 
                             if hasMore {
@@ -8342,9 +8376,6 @@ private struct TvStreamPickerOverlay: View {
                                 .frame(maxWidth: .infinity, alignment: .center)
                                 .padding(.top, 12)
                                 .padding(.bottom, 20)
-                                .onAppear {
-                                    loadMoreStreams()
-                                }
                             } else if isLoading {
                                 HStack(spacing: 18) {
                                     ProgressView()
@@ -8502,7 +8533,6 @@ private struct TvStreamPickerOverlay: View {
     private func seedInitialFocus() {
         DispatchQueue.main.async {
             guard pickerIsVisible else { return }
-            refreshDisplayedStreamsIfNeeded()
             guard focusedItem == nil || focusedItem == filterAllKey else { return }
             if didSeedStreamFocus {
                 let restored = restoredSourceFocusID.flatMap { id in
@@ -8545,21 +8575,24 @@ private struct TvStreamPickerOverlay: View {
     }
 
     private func performRefresh() {
-        guard !isResolvingDebrid else { return }
+        guard !isResolvingDebrid, !isRefreshing, let onRefresh else { return }
+        // Keep focus on a persistent control while refreshed results are empty.
+        focusedItem = filterAllKey
+        selectedAddonId = nil
+        visibleStreamLimit = StreamPickerListBuilder.defaultPageSize
         didSeedStreamFocus = false
         restoredSourceFocusID = nil
         isRefreshing = true
         withAnimation(.easeInOut(duration: 0.25)) {
             showRefreshToast = true
         }
-        onRefresh?()
+        onRefresh()
 
         refreshToastTask?.cancel()
         refreshToastTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             guard !Task.isCancelled else { return }
             withAnimation(.easeInOut(duration: 0.25)) {
-                isRefreshing = false
                 showRefreshToast = false
             }
         }

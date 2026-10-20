@@ -13,6 +13,28 @@ private enum TestStreamError: Error { case failed }
 
 final class StreamsDiscoveryTests: XCTestCase {
 
+    func testPaginationExpandsOnlyWhenFocusReachesCurrentPageEnd() {
+        let streams = (0..<65).map { NuvioStream(url: "https://example.com/\($0).mp4", name: "Stream \($0)", description: nil, addonName: "Test") }
+        for id in [nil, "filter::refresh", streams[0].id, streams[15].id, streams[40].id] {
+            XCTAssertEqual(StreamPickerListBuilder.limitAfterFocus(id, streams: streams, currentLimit: 20), 20)
+        }
+        XCTAssertEqual(StreamPickerListBuilder.limitAfterFocus(streams[16].id, streams: streams, currentLimit: 20), 40)
+        // Repeated focus on the old boundary must not cascade through all pages.
+        XCTAssertEqual(StreamPickerListBuilder.limitAfterFocus(streams[16].id, streams: streams, currentLimit: 40), 40)
+        XCTAssertEqual(StreamPickerListBuilder.limitAfterFocus(streams[59].id, streams: streams, currentLimit: 60), 65)
+        XCTAssertEqual(StreamPickerListBuilder.limitAfterFocus(streams[64].id, streams: streams, currentLimit: 65), 65)
+    }
+
+    func testBackgroundListWorkerPreservesFilterAndSortSemantics() async {
+        let streams = (0..<200).map {
+            NuvioStream(url: "https://example.com/\($0).mp4", name: "1080p WEB-DL", description: nil, addonName: "Test", videoSize: Int64($0 + 1))
+        }
+        let groups = [AddonStreamGroup(addonId: "test", displayName: "Test", streams: streams, isLoading: false)]
+        let key = StreamPickerListBuilder.cacheKey(revision: 1, selectedAddonId: "test", sortOption: .size, includeDebrid: false)
+        let result = await StreamPickerListWorker.shared.build(streams: [], groups: groups, key: key)
+        XCTAssertEqual(result.map(\.id), streams.reversed().map(\.id))
+    }
+
     func testStreamRequestRetryPolicyRetriesTransientErrorsOnly() {
         XCTAssertFalse(StreamsRepository.StreamRequestRetryPolicy.shouldRetry(URLError(.timedOut)))
         XCTAssertTrue(StreamsRepository.StreamRequestRetryPolicy.shouldRetry(URLError(.networkConnectionLost)))
