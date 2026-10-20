@@ -1015,6 +1015,22 @@ enum EpisodeReleasePolicy {
               validatedCalendarDay(String(raw.prefix(10))) != nil else {
             return .invalid
         }
+        // Prevent tolerant platform parsers normalizing impossible clock values.
+        guard let hour = Int(raw.dropFirst(11).prefix(2)),
+              let minute = Int(raw.dropFirst(14).prefix(2)),
+              hour < 24, minute < 60 else { return .invalid }
+        if raw.dropFirst(16).first == ":" {
+            guard let second = Int(raw.dropFirst(17).prefix(2)), second < 60 else {
+                return .invalid
+            }
+        }
+        if let offset = raw.range(of: #"[+-]\d{2}:?\d{2}$"#, options: .regularExpression) {
+            let digits = raw[offset].dropFirst().filter { $0.isNumber }
+            guard digits.count == 4,
+                  let offsetHour = Int(digits.prefix(2)),
+                  let offsetMinute = Int(digits.suffix(2)),
+                  offsetHour <= 23, offsetMinute < 60 else { return .invalid }
+        }
         let zoned = raw.hasSuffix("Z")
             || raw.range(of: #"[+-]\d{2}:?\d{2}$"#, options: .regularExpression) != nil
         if zoned {
