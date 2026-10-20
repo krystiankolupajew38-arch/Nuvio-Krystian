@@ -717,7 +717,7 @@ enum ContinueWatchingBuilder {
                         lastWatchedAt: record.lastWatchedAt,
                         season: season,
                         episode: ep,
-                        released: tmdbEpisode?.released ?? next.released,
+                        released: EpisodeReleasePolicy.preferredRelease(primary: next.released, fallback: tmdbEpisode?.released),
                         episodeTitleOverride: tmdbEpisode?.title ?? nonPlaceholder(next.title),
                         episodeOverviewOverride: tmdbEpisode?.overview ?? nonEmpty(next.overview),
                         episodeThumbnailOverride: tmdbEpisode?.thumbnail ?? next.thumbnail,
@@ -737,7 +737,13 @@ enum ContinueWatchingBuilder {
                         lastWatchedAt: record.lastWatchedAt,
                         season: record.season,
                         episode: record.episode,
-                        released: tmdbEpisode?.released ?? video?.released ?? (sameEpisode ? existing?.released : nil),
+                        released: EpisodeReleasePolicy.preferredRelease(
+                            primary: EpisodeReleasePolicy.preferredRelease(
+                                primary: video?.released,
+                                fallback: sameEpisode ? existing?.released : nil
+                            ),
+                            fallback: tmdbEpisode?.released
+                        ),
                         episodeTitleOverride: tmdbEpisode?.title
                             ?? nonPlaceholder(video?.title)
                             ?? (sameEpisode ? existing?.episodeTitleOverride : nil),
