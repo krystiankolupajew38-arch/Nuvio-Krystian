@@ -8244,6 +8244,7 @@ private struct TvStreamPickerOverlay: View {
         HStack(spacing: 18) {
             // Only add-on filters scroll. Vertical/edge padding gives the 1.06x
             // focused scale room to draw without the ScrollView clipping it.
+            ScrollViewReader { filterProxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 18) {
                     TvStreamFilterButton(
@@ -8253,6 +8254,7 @@ private struct TvStreamPickerOverlay: View {
                         focusValue: filterAllKey,
                         action: { selectedAddonId = nil }
                     )
+                    .id(filterAllKey)
 
                     // Preserve configured add-on order from discovery groups.
                     ForEach(filterGroups) { group in
@@ -8263,10 +8265,16 @@ private struct TvStreamPickerOverlay: View {
                             focusValue: filterKey(group.addonId),
                             action: { selectedAddonId = group.addonId }
                         )
+                        .id(filterKey(group.addonId))
                     }
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 12)
+            }
+            .onChange(of: focusedItem) { _, focused in
+                guard let focused, focused == filterAllKey || filterGroups.contains(where: { filterKey($0.addonId) == focused }) else { return }
+                filterProxy.scrollTo(focused, anchor: .center)
+            }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -8412,6 +8420,10 @@ private struct TvStreamPickerOverlay: View {
                         .padding(40)
                     }
                     .focusSection()
+                    .onMoveCommand { direction in
+                        guard direction == .up, focusedItem == streamsToShow.first?.id else { return }
+                        focusedItem = selectedAddonId.map(filterKey) ?? filterAllKey
+                    }
                     .onAppear {
                         if let id = restoredSourceFocusID { proxy.scrollTo(id, anchor: .center) }
                     }
@@ -8597,8 +8609,7 @@ private struct TvStreamPickerOverlay: View {
     private func performRefresh() {
         guard !isResolvingDebrid, !isRefreshing, let onRefresh else { return }
         // Keep focus on a persistent control while refreshed results are empty.
-        focusedItem = filterAllKey
-        selectedAddonId = nil
+        focusedItem = selectedAddonId.map(filterKey) ?? filterAllKey
         visibleStreamLimit = StreamPickerListBuilder.defaultPageSize
         didSeedStreamFocus = false
         restoredSourceFocusID = nil
