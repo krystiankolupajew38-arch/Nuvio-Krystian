@@ -825,12 +825,16 @@ struct PosterCard: View {
     }
 
     private var shouldBlurEpisodeStill: Bool {
-        guard blurUnwatchedEpisodes, !continueEpisodeIsWatched,
-              isContinueOrUpcomingCard, effectiveLandscape,
-              continueEpisodeText != nil,
-              let still = continueEpisodeArtworkURL?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !still.isEmpty else { return false }
-        return imageUrl == still
+        guard let still = continueEpisodeArtworkURL?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return false
+        }
+        return EpisodeSpoilerPolicy.shouldBlur(
+            enabled: blurUnwatchedEpisodes,
+            isWatched: continueEpisodeIsWatched,
+            hasEpisodeArtwork: !still.isEmpty,
+            displaysEpisodeArtwork: isContinueOrUpcomingCard && effectiveLandscape
+                && continueEpisodeText != nil && imageUrl == still
+        )
     }
 
     private var landscapePreloadURL: String? {
