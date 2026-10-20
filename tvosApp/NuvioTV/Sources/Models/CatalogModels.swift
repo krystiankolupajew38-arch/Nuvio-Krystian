@@ -1025,7 +1025,7 @@ enum EpisodeReleasePolicy {
             }
         }
         if let offset = raw.range(of: #"[+-]\d{2}:?\d{2}$"#, options: .regularExpression) {
-            let digits = raw[offset].dropFirst().filter { $0.isNumber }
+            let digits = String(raw[offset].dropFirst().filter { $0.isNumber })
             guard digits.count == 4,
                   let offsetHour = Int(digits.prefix(2)),
                   let offsetMinute = Int(digits.suffix(2)),
