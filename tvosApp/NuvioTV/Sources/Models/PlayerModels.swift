@@ -703,7 +703,7 @@ enum ExternalPlaybackReturnHandler {
             // Infuse scrobbles to the user's Trakt account independently.
             // Keep our immediate local checkpoint, but do not send a second
             // competing pause position from Nuvio for the same episode.
-            if session.externalPlayerName != ExternalPlayer.infuse.rawValue || source != .trakt {
+            if duration > 0 && (session.externalPlayerName != ExternalPlayer.infuse.rawValue || source != .trakt) {
                 Task { @MainActor in
                 guard ProfileSettings.activeProfileID == profileID, ProfileSettings.isActiveStore(store) else { return }
                 _ = await TraktProgressService.reportPlayback(
