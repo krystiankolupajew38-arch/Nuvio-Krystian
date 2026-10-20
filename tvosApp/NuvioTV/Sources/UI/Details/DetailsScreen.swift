@@ -7324,6 +7324,7 @@ private struct TvEpisodeCard: View {
 
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
+    @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
 
     private var cardKey: String { TvEpisodeFocus.card(video.id) }
     private var isFocused: Bool { focus.wrappedValue == cardKey }
@@ -7568,6 +7569,11 @@ private struct TvEpisodeCard: View {
             placeholder: { placeholderThumb }
         )
         .frame(width: cardWidth, height: cardHeight)
+        // Nuvio Mobile: 18.dp soft-focus on episode art only. The series
+        // fallback image is not an episode spoiler and stays unblurred.
+        .blur(radius: blurUnwatchedEpisodes && !isWatched &&
+            video.thumbnail?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? 18 : 0, opaque: true)
         .clipped()
     }
 
