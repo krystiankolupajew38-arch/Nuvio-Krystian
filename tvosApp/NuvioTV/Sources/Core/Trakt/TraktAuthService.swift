@@ -1756,7 +1756,10 @@ struct TraktProgressService {
                     // restarting an episode on another device is legitimate.
                     // Ignore remote snapshots whose timestamp is only marginally
                     // ahead of a local callback (clock skew / delayed scrobble).
-                    if remoteIsSubstantiallyNewer {
+                    if remoteIsSubstantiallyNewer && remote.duration > 0 {
+                        // A newer percentage without a measured duration cannot
+                        // replace an exact second-based callback. Keep the
+                        // checkpoint until a comparable timeline exists.
                         // User genuinely continued playback on another device.
                         // Inherit verified stream duration if remote has an estimated duration.
                         let resolvedDuration = local.duration > 100 ? local.duration : remote.duration
