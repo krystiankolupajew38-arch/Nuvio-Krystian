@@ -1172,12 +1172,34 @@ enum EpisodeReleasePolicy {
         return components.date
     }
 
-    private static func isoDay(_ value: String?) -> String? {
+    /// Date-only metadata is a provider calendar date; timestamped metadata
+    /// represents an instant and must use the Apple TV's current timezone.
+    static func localReleaseDay(_ value: String?, timeZone: TimeZone = .current) -> String? {
         guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines),
               raw.count >= 10 else { return nil }
         let day = String(raw.prefix(10))
-        guard day.split(separator: "-").count == 3 else { return nil }
-        return day
+        let parts = day.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3, day.count == 10 else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let dateOnly = DateComponents(year: parts[0], month: parts[1], day: parts[2])
+        guard let validatedDay = calendar.date(from: dateOnly),
+              calendar.dateComponents([.year, .month, .day], from: validatedDay).year == parts[0],
+              calendar.dateComponents([.year, .month, .day], from: validatedDay).month == parts[1],
+              calendar.dateComponents([.year, .month, .day], from: validatedDay).day == parts[2] else { return nil }
+        guard raw.count > 10, raw.dropFirst(10).first == "T" else { return day }
+        // Timezone-less ISO timestamps describe the provider's local date.
+        // Never interpret them as UTC just because a formatter does.
+        guard raw.hasSuffix("Z") || raw.range(of: #"[+-][0-9]{2}:?[0-9]{2}$"#, options: .regularExpression) != nil else { return day }
+        guard let instant = fractionalISO8601Formatter.date(from: raw)
+            ?? standardISO8601Formatter.date(from: raw) else { return nil }
+        let components = calendar.dateComponents([.year, .month, .day], from: instant)
+        guard let year = components.year, let month = components.month, let date = components.day else { return nil }
+        return String(format: "%04d-%02d-%02d", year, month, date)
+    }
+
+    private static func isoDay(_ value: String?) -> String? {
+        localReleaseDay(value)
     }
 
     private static func todayIsoDay() -> String {
