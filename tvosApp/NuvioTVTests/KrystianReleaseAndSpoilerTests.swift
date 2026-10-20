@@ -147,5 +147,7 @@ final class KrystianReleaseAndSpoilerTests: XCTestCase {
         XCTAssertFalse(SettingsKey.deviceLocal.contains(SettingsKey.blurUnwatchedEpisodes))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.tmdbLanguage))
         XCTAssertFalse(SettingsKey.deviceLocal.contains(SettingsKey.tmdbLanguage))
+        XCTAssertTrue(SettingsKey.all.contains(SettingsKey.releaseDateDiagnostics))
+        XCTAssertTrue(SettingsKey.deviceLocal.contains(SettingsKey.releaseDateDiagnostics))
     }
 }
