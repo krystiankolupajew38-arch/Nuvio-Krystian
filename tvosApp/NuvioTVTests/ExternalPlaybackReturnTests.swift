@@ -48,7 +48,10 @@ final class ExternalPlaybackReturnTests: XCTestCase {
             writes += 1
             return false
         })
-        XCTAssertEqual(ExternalPlaybackSessionStore.load(defaults: defaults), session)
+        var stagedSession = session
+        stagedSession.returnedCallback = callback
+        stagedSession.returnedAt = ExternalPlaybackSessionStore.load(defaults: defaults)?.returnedAt
+        XCTAssertEqual(ExternalPlaybackSessionStore.load(defaults: defaults), stagedSession)
         XCTAssertTrue(ExternalPlaybackReturnHandler.handle(callback, profileID: session.profileID, defaults: defaults) { captured, position, duration in
             XCTAssertEqual(captured.season, 1)
             XCTAssertEqual(captured.episode, 3)
@@ -106,7 +109,7 @@ final class ExternalPlaybackReturnTests: XCTestCase {
         ) { captured, position, duration in
             XCTAssertEqual(captured.episode, session.episode)
             XCTAssertEqual(position, 312)
-            XCTAssertEqual(duration, 2_000)
+            XCTAssertEqual(duration, 0)
             writes += 1
             return true
         })
@@ -211,4 +214,138 @@ final class ExternalPlaybackReturnTests: XCTestCase {
         ) { _, _, _ in XCTFail("Error callback persisted progress"); return true })
         XCTAssertNil(ExternalPlaybackSessionStore.load(defaults: defaults))
     }
+    func testSourceURLNormalizationPreservesStreamIdentity() {
+        XCTAssertTrue(ExternalPlaybackSessionStore.sameSourceURL(
+            "https://EXAMPLE.invalid:443/media/%7efile?q=%41%2f", "https://example.invalid/media/~file?q=A%2F"))
+        for different in ["https://example.invalid/media/other", "https://example.invalid/media/~file?q=A/",
+                          "https://other.invalid/media/~file?q=A%2F", "http://example.invalid/media/~file?q=A%2F",
+                          "https://example.invalid/media/~file?q=A%2F&token=other"] {
+            XCTAssertFalse(ExternalPlaybackSessionStore.sameSourceURL("https://example.invalid/media/~file?q=A%2F", different))
+        }
+    }
+
+    func testCallbackRejectsExtraPathComponents() {
+        XCTAssertNil(ExternalPlaybackCallback.parse(URL(string: "nuvio-krystian://external-playback/id/other?position=20")!))
+    }
+
+    @MainActor
+    func testNewHandoffCannotEraseUnprocessedReturn() {
+        let suite = "external-pending-protection-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let session = externalFixture()
+        XCTAssertTrue(ExternalPlaybackSessionStore.save(session, defaults: defaults))
+        let callback = ExternalPlaybackCallback(id: session.id, isError: false, progress: nil, position: 200)
+        XCTAssertTrue(ExternalPlaybackSessionStore.stage(callback, defaults: defaults))
+        let next = ExternalPlaybackSession(id: "new", meta: session.meta, sourceURL: session.sourceURL,
+            season: 1, episode: 4, duration: nil, profileID: "different")
+        XCTAssertFalse(ExternalPlaybackSessionStore.save(next, defaults: defaults))
+        XCTAssertEqual(ExternalPlaybackSessionStore.load(defaults: defaults)?.returnedCallback, callback)
+    }
+
+    func testPercentageResumeMatchesEpisodeAndDoesNotOverrideExactSeconds() {
+        let meta = externalFixture().meta
+        let item = ContinueWatchingItem(meta: meta, streamUrl: "", position: 0, duration: 0,
+            lastWatchedAt: Date(), season: 1, episode: 3, explicitProgressPercent: 42)
+        XCTAssertEqual(item.resumeProgressFraction(season: 1, episode: 3), 0.42)
+        XCTAssertNil(item.resumeProgressFraction(season: 1, episode: 4))
+        XCTAssertNil(item.resumeProgressFraction(season: nil, episode: nil))
+        let launch = ExternalPlayer.infuse.launchURL(for: URL(string: "https://example.invalid/video")!, position: item.resumePositionIfKnown)!
+        XCTAssertFalse(URLComponents(url: launch, resolvingAgainstBaseURL: false)!.queryItems!.contains { $0.name == "position" })
+        let exact = ContinueWatchingItem(meta: meta, streamUrl: "", position: 700, duration: 0,
+            lastWatchedAt: Date(), season: 1, episode: 3, explicitProgressPercent: 42)
+        XCTAssertNil(exact.resumeProgressFraction)
+        XCTAssertEqual(exact.resumePosition, 700)
+    }
+
+    @MainActor
+    func testExactInfuseCheckpointSurvivesExpiryAndNewerRemoteRewindUsesPercentage() {
+        let previous = ContinueWatchingStore.activeProfileId
+        let profile = "external-checkpoint-\(UUID().uuidString)"
+        ContinueWatchingStore.setActiveProfile(profile)
+        let meta = externalFixture().meta
+        defer {
+            TraktProgressService.forgetLocalPlayback(meta: meta, notify: false)
+            ContinueWatchingStore.setActiveProfile(previous)
+        }
+        let old = Date().addingTimeInterval(-7200)
+        XCTAssertTrue(TraktProgressService.recordLocalPlayback(meta: meta, position: 1400, duration: 0,
+            season: 1, episode: 3, source: .trakt, notify: false, preservesExactPosition: true, recordedAt: old))
+        TraktProgressService.reloadCheckpointsForTesting()
+        XCTAssertEqual(TraktProgressService.currentContinueWatchingItem(for: meta, source: .trakt)?.position, 1400)
+        XCTAssertNil(TraktProgressService.currentContinueWatchingItem(for: meta, source: .simkl))
+        let stale = ContinueWatchingItem(meta: meta, streamUrl: "", position: 0, duration: 0,
+            lastWatchedAt: old.addingTimeInterval(10), season: 1, episode: 3, explicitProgressPercent: 70)
+        let merged = TraktProgressService.mergingLocalPlaybackCheckpoints(into: [stale], source: .trakt)
+        XCTAssertEqual(merged.first?.position, 1400)
+        XCTAssertEqual(merged.first?.duration, 0)
+        let newer = ContinueWatchingItem(meta: meta, streamUrl: "", position: 0, duration: 0,
+            lastWatchedAt: old.addingTimeInterval(300), season: 1, episode: 3, explicitProgressPercent: 20)
+        let rewound = TraktProgressService.mergingLocalPlaybackCheckpoints(into: [newer], source: .trakt)
+        XCTAssertEqual(rewound.first?.resumeProgressFraction, 0.2)
+        XCTAssertEqual(rewound.first?.position, 0)
+    }
+
+    func testExplicitInfuseRestartOverridesNativeResume() {
+        let url = ExternalPlayer.infuse.launchURL(for: URL(string: "https://example.invalid/episode")!, position: 0)!
+        let query = URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems!
+        XCTAssertEqual(query.first { $0.name == "position" }?.value, "0")
+    }
+
+    func testInfuseSecondsDoNotCompleteAgainstUnverifiedHistoricalDuration() {
+        var session = externalFixture()
+        session.externalPlayerName = ExternalPlayer.infuse.rawValue
+        let callback = ExternalPlaybackCallback(id: session.id, isError: false, progress: nil, position: 1950)
+        XCTAssertEqual(session.sample(for: callback)?.duration, 0)
+        var measured = callback
+        measured.duration = 2000
+        XCTAssertEqual(session.sample(for: measured)?.duration, 2000)
+    }
+
+    @MainActor
+    func testOrdinaryCheckpointStillExpiresAndProfilesStayIsolated() {
+        let previous = ContinueWatchingStore.activeProfileId
+        let profile = "checkpoint-expiry-\(UUID().uuidString)"
+        ContinueWatchingStore.setActiveProfile(profile)
+        let meta = externalFixture().meta
+        defer {
+            ContinueWatchingStore.setActiveProfile(profile)
+            TraktProgressService.forgetLocalPlayback(meta: meta, notify: false)
+            ContinueWatchingStore.setActiveProfile(previous)
+        }
+        XCTAssertTrue(TraktProgressService.recordLocalPlayback(meta: meta, position: 100, duration: 2000,
+            season: 1, episode: 3, source: .trakt, notify: false, recordedAt: Date().addingTimeInterval(-7200)))
+        XCTAssertTrue(TraktProgressService.mergingLocalPlaybackCheckpoints(into: [], source: .trakt).isEmpty)
+        XCTAssertTrue(TraktProgressService.recordLocalPlayback(meta: meta, position: 700, duration: 0,
+            season: 1, episode: 3, source: .trakt, notify: false, preservesExactPosition: true))
+        ContinueWatchingStore.setActiveProfile("different-\(profile)")
+        XCTAssertTrue(TraktProgressService.mergingLocalPlaybackCheckpoints(into: [], source: .trakt).isEmpty)
+        ContinueWatchingStore.setActiveProfile(profile)
+        XCTAssertEqual(TraktProgressService.mergingLocalPlaybackCheckpoints(into: [], source: .trakt).first?.position, 700)
+    }
+
+    @MainActor
+    func testInfuseCompletionDoesNotQueueTraktHistoryAndRetiresOlderCheckpoint() {
+        let previous = ContinueWatchingStore.activeProfileId
+        let previousWatched = WatchedStore.activeProfileId
+        let profile = "infuse-completion-\(UUID().uuidString)"
+        ContinueWatchingStore.setActiveProfile(profile)
+        WatchedStore.setActiveProfile(profile)
+        let meta = externalFixture().meta
+        defer {
+            TraktProgressService.forgetLocalPlayback(meta: meta, notify: false)
+            WatchedStore.eraseProfile(profile)
+            WatchedStore.setActiveProfile(previousWatched)
+            ContinueWatchingStore.setActiveProfile(previous)
+        }
+        XCTAssertTrue(TraktProgressService.recordLocalPlayback(meta: meta, position: 1400, duration: 0,
+            season: 1, episode: 3, source: .trakt, notify: false, preservesExactPosition: true,
+            recordedAt: Date().addingTimeInterval(-7200)))
+        XCTAssertTrue(WatchedStore.recordPlaybackCompletion(meta, season: 1, episode: 3,
+            completionID: "infuse-complete", source: .trakt, completionAccounts: [TraktWatchProgressSource.trakt.rawValue: "fixture-account"],
+            externallyReportedProviders: [.trakt]))
+        XCTAssertTrue(WatchedStore.pendingPlaybackCompletions(provider: .trakt, profileId: profile).isEmpty)
+        XCTAssertTrue(TraktProgressService.mergingLocalPlaybackCheckpoints(into: [], source: .trakt).isEmpty)
+    }
+
 }

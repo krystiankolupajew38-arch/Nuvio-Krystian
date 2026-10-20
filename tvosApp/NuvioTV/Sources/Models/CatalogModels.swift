@@ -2140,11 +2140,26 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
         return max(0, min(position, max(duration - 5, 0)))
     }
 
+    /// Nil leaves an external player's own resume intact for percentage-only rows.
+    /// An explicit user restart is passed separately as zero by the caller.
+    var resumePositionIfKnown: Double? {
+        guard !isUpNextEntry, resumePosition > 0 else { return nil }
+        return resumePosition
+    }
+
     /// Used only by the built-in player after it knows the actual stream length.
     var resumeProgressFraction: Double? {
         guard duration <= 0, position <= 0, let explicitProgressPercent,
               explicitProgressPercent > 0, explicitProgressPercent < 90 else { return nil }
         return explicitProgressPercent / 100
+    }
+
+    func resumeProgressFraction(season: Int?, episode: Int?) -> Double? {
+        guard !isUpNextEntry else { return nil }
+        if meta.isSeries {
+            guard let season, let episode, self.season == season, self.episode == episode else { return nil }
+        }
+        return resumeProgressFraction
     }
 
     var remainingText: String {
@@ -7736,7 +7751,8 @@ enum WatchedStore {
         episode: Int? = nil,
         completionID: String,
         source capturedSource: TraktWatchProgressSource? = nil,
-        completionAccounts: [String: String]? = nil
+        completionAccounts: [String: String]? = nil,
+        externallyReportedProviders: Set<TraktWatchProgressSource> = []
     ) -> Bool {
         let completionID = completionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !completionID.isEmpty else { return false }
@@ -7786,7 +7802,7 @@ enum WatchedStore {
         lastIDsBySource[sourceKey] = completionID
         let watchedAt = Date()
         var pendingCompletions = existing?.pendingPlaybackCompletions ?? []
-        for target in completionTargets {
+        for target in completionTargets where !externallyReportedProviders.contains(target.provider) {
             let event = WatchedPlaybackCompletionUpload(
                 completionID: completionID,
                 provider: target.provider,

@@ -336,6 +336,42 @@ final class ActionPlaybackSessionTests: XCTestCase {
 }
 
 final class PlayerControlsSettingsTests: XCTestCase {
+    @MainActor
+    func testPercentageResumeWithZeroSeedSeeksAfterActualDurationLoads() {
+        let previous = ContinueWatchingStore.activeProfileId
+        let profile = "percent-seek-\(UUID().uuidString)"
+        ContinueWatchingStore.setActiveProfile(profile)
+        defer { ContinueWatchingStore.eraseProfile(profile); ContinueWatchingStore.setActiveProfile(previous) }
+        for (seconds, fraction, expected) in [(0.0, Optional(0.42), 1260.0), (700.0, Optional(0.42), 700.0), (0.0, nil, 1.0)] {
+            var requestedSeconds: Double?
+            let coordinator = PlaybackSessionCoordinator(engineSettingProvider: { "MPVKit" }, loadDispatcher: { request, _, _ in
+                requestedSeconds = request.resumePositionSeconds
+            })
+            let model = PlayerViewModel(sessionCoordinator: coordinator)
+            model.load(url: URL(string: "https://example.invalid/video.mkv")!,
+                meta: NuvioMeta(id: "percent-resume-test", name: "Fixture", type: "movie"),
+                subtitle: "", resumeFrom: seconds, resumeFraction: fraction)
+            let engine = PlayerControlsTestEngine()
+            engine.isPlayerPlaying = true
+            engine.isTransportPlaying = true
+            engine.hasCoherentTimeSample = true
+            engine.hasFirstFrameReadyForDisplay = true
+            engine.positionMs = 1000
+            model.pollForTesting(using: engine)
+            XCTAssertLessThan(model.time.current, 5)
+            engine.durationMs = 3_000_000
+            model.pollForTesting(using: engine)
+            if seconds > 0 {
+                // Exact seconds are applied by the coordinator's initial load.
+                XCTAssertEqual(requestedSeconds, expected)
+                XCTAssertEqual(model.time.current, 1)
+            } else {
+                XCTAssertEqual(model.time.current, expected, accuracy: 0.01)
+            }
+            model.shutdown()
+        }
+    }
+
     func testPlayerControlsSettingsKeysDefined() {
         XCTAssertEqual(SettingsKey.playerShowPiP, "nuvio.tv.settings.playback.showPiP")
         XCTAssertEqual(SettingsKey.playerShowEpisodes, "nuvio.tv.settings.playback.showEpisodes")

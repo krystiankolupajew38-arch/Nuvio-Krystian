@@ -1223,7 +1223,8 @@ struct ContentView: View {
     private static func resumePosition(for item: ContinueWatchingItem) -> Double? {
         let currentItem: ContinueWatchingItem
         if RemoteTrackingState.isProgressSourceAuthenticated,
-           let latest = TraktProgressService.currentContinueWatchingItem(for: item.meta) {
+           let latest = TraktProgressService.currentContinueWatchingItem(for: item.meta),
+           latest.season == item.season, latest.episode == item.episode {
             currentItem = latest
         } else {
             currentItem = item
@@ -1235,7 +1236,7 @@ struct ContentView: View {
             // an older checkpoint for the same episode (or no checkpoint at
             // all), so never cross the two progress sources here.
             if RemoteTrackingState.isProgressSourceAuthenticated {
-                return currentItem.isUpNextEntry ? nil : currentItem.resumePosition
+                return currentItem.resumePositionIfKnown
             }
             guard let numbers = currentItem.episodeNumbers else { return nil }
             let episodeId = currentItem.meta.videos?.first {
@@ -1249,7 +1250,7 @@ struct ContentView: View {
             )
         }
         guard !WatchedStore.contains(meta: currentItem.meta) else { return nil }
-        return currentItem.resumePosition
+        return currentItem.resumePositionIfKnown
     }
 
     private static func resumePosition(for meta: NuvioMeta, episode: NuvioVideo?) -> Double? {
@@ -1261,7 +1262,7 @@ struct ContentView: View {
                       item.season == episode.season,
                       item.episode == episode.episode else { return nil }
             }
-            return item.resumePosition
+            return item.resumePositionIfKnown
         }
 
         if meta.isSeries {
@@ -1275,6 +1276,12 @@ struct ContentView: View {
         }
         guard !WatchedStore.contains(meta: meta) else { return nil }
         return ContinueWatchingStore.item(for: meta.id)?.resumePosition
+    }
+
+    private static func resumeFraction(for meta: NuvioMeta, episode: NuvioVideo?) -> Double? {
+        guard RemoteTrackingState.isProgressSourceAuthenticated,
+              let item = TraktProgressService.currentContinueWatchingItem(for: meta) else { return nil }
+        return item.resumeProgressFraction(season: episode?.season, episode: episode?.episode)
     }
 
     private static func seasonSortKey(_ season: Int) -> Int {
@@ -1331,7 +1338,7 @@ struct ContentView: View {
                 meta: item.meta,
                 subtitle: item.episodeSubtitle ?? "",
                 externalSubtitles: [],
-                resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item),
+                resumeFrom: startFromBeginning ? 0 : Self.resumePosition(for: item),
                 resumeFraction: startFromBeginning ? nil : item.resumeProgressFraction,
                 httpHeaders: httpHeaders,
                 collectionContext: provenance
@@ -1393,8 +1400,8 @@ struct ContentView: View {
                     meta: item.meta,
                     subtitle: prepared.subtitleLine,
                     externalSubtitles: prepared.subtitles,
-                    resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item),
-                resumeFraction: startFromBeginning ? nil : item.resumeProgressFraction,
+                    resumeFrom: startFromBeginning ? 0 : Self.resumePosition(for: item),
+                    resumeFraction: startFromBeginning ? nil : item.resumeProgressFraction,
                     httpHeaders: prepared.httpHeaders,
                     filename: prepared.filename,
                     videoSize: prepared.videoSize,
@@ -1524,7 +1531,6 @@ struct ContentView: View {
         isActionPlaybackSession: Bool = false
     ) {
         playbackIsActionPlaybackSession = isActionPlaybackSession
-        playbackResumeFraction = resumeFrom == nil || resumeFrom == 0 ? resumeFraction : nil
         let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
         let isStandalonePlaybackSession = isTrailer || isActionPlaybackSession
         if !isStandalonePlaybackSession && (creatingParty || choosingPartySource) {
@@ -1634,11 +1640,9 @@ struct ContentView: View {
                successURL: successCallback,
                errorURL: errorCallback
            ),
-           UIApplication.shared.canOpenURL(launchURL) {
+           UIApplication.shared.canOpenURL(launchURL),
+           externalSession.map({ ExternalPlaybackSessionStore.save($0) }) ?? true {
             PlaybackStartupTiming.cancel(token: startupBenchmarkToken)
-            if let externalSession {
-                ExternalPlaybackSessionStore.save(externalSession)
-            }
             UIApplication.shared.open(launchURL, options: [:]) { opened in
                 if !opened, let externalSession {
                     _ = ExternalPlaybackSessionStore.consume(
@@ -1656,6 +1660,7 @@ struct ContentView: View {
             httpHeaders: httpHeaders,
             externalSubtitles: externalSubtitles,
             resumeFrom: isActionPlaybackSession ? nil : resumeFrom,
+            resumeFraction: isStandalonePlaybackSession ? nil : resumeFraction,
             origin: origin,
             cacheFileIdentity: cacheFileIdentity,
             filename: filename,
@@ -1898,6 +1903,7 @@ struct ContentView: View {
         httpHeaders: [String: String],
         externalSubtitles: [NuvioSubtitle],
         resumeFrom: Double?,
+        resumeFraction: Double? = nil,
         origin: PlaybackOrigin,
         cacheFileIdentity: PlaybackCacheFileIdentity? = nil,
         filename: String? = nil,
@@ -1908,6 +1914,7 @@ struct ContentView: View {
         collectionContext: CollectionPlaybackContext? = nil,
         party: WatchPartyAppOwner.Presentation? = nil
     ) {
+        playbackResumeFraction = party == nil && (resumeFrom ?? 0) <= 0 ? resumeFraction : nil
         if party == nil {
             partyLaunchID = UUID()
             partyLaunchTask?.cancel(); partyLaunchTask = nil
@@ -2475,6 +2482,7 @@ struct ContentView: View {
                         subtitle: subtitle,
                         externalSubtitles: externalSubtitles,
                         resumeFrom: isActionPlaybackSession ? nil : (isTrailer ? resumeFrom : (resumeFrom ?? Self.resumePosition(for: meta, episode: currentEpisode))),
+                        resumeFraction: isActionPlaybackSession || isTrailer || resumeFrom != nil ? nil : Self.resumeFraction(for: meta, episode: currentEpisode),
                         httpHeaders: httpHeaders,
                         origin: .details,
                         customPlayer: player,

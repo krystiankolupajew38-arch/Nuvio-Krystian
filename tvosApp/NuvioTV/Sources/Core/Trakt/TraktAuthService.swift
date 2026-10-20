@@ -1212,6 +1212,9 @@ struct TraktProgressService {
         let profileId: String?
         let source: TraktWatchProgressSource
         let item: ContinueWatchingItem
+        // Exact external-player seconds have no server equivalent when duration
+        // is unknown. Keep them until newer playback or a watched mark replaces them.
+        var preservesExactPosition: Bool? = nil
     }
 
     private struct ContinueWatchingSnapshot {
@@ -1237,9 +1240,12 @@ struct TraktProgressService {
             return loaded
         }
         set {
-            cachedCheckpoints = newValue
-            saveCheckpoints(newValue)
+            if saveCheckpoints(newValue) { cachedCheckpoints = newValue }
         }
+    }
+
+    static func reloadCheckpointsForTesting() {
+        cachedCheckpoints = nil
     }
 
     private static let checkpointDirectoryName = "traktCheckpoints"
@@ -1267,11 +1273,6 @@ struct TraktProgressService {
 
     @discardableResult
     private static func saveCheckpoints(_ checkpoints: [LocalPlaybackCheckpoint]) -> Bool {
-        guard !checkpoints.isEmpty else {
-            LargePayloadStore.remove(key: checkpointStorageKey, directory: checkpointDirectoryName)
-            UserDefaults.standard.removeObject(forKey: checkpointStorageKey)
-            return true
-        }
         guard let data = try? checkpointEncoder().encode(checkpoints) else { return false }
         guard LargePayloadStore.write(data, key: checkpointStorageKey, directory: checkpointDirectoryName) else { return false }
         UserDefaults.standard.removeObject(forKey: checkpointStorageKey)
@@ -1344,7 +1345,9 @@ struct TraktProgressService {
         season: Int?,
         episode: Int?,
         source sourceOverride: TraktWatchProgressSource? = nil,
-        notify: Bool
+        notify: Bool,
+        preservesExactPosition: Bool = false,
+        recordedAt: Date = Date()
     ) -> Bool {
         guard position.isFinite,
               duration.isFinite,
@@ -1385,7 +1388,7 @@ struct TraktProgressService {
                         streamUrl: "",
                         position: position,
                         duration: duration,
-                        lastWatchedAt: Date(),
+                        lastWatchedAt: recordedAt,
                         season: season,
                         episode: episode,
                         released: video?.released,
@@ -1393,7 +1396,8 @@ struct TraktProgressService {
                         episodeOverviewOverride: video?.overview,
                         episodeThumbnailOverride: video?.thumbnail,
                         isUpNext: false
-                    )
+                    ),
+                    preservesExactPosition: preservesExactPosition
                 )
             )
         } else {
@@ -1743,8 +1747,19 @@ struct TraktProgressService {
         var merged = remoteItems
         var confirmedItems: [ContinueWatchingItem] = []
 
+        let watched = WatchedStore.activeProfileId == profileId ? WatchedStore.items() : []
         for checkpoint in checkpoints {
             let local = checkpoint.item
+            if watched.contains(where: {
+                WatchedStore.sameContent($0.meta, local.meta) && $0.season == local.season
+                    && $0.episode == local.episode && $0.watchedAt >= local.lastWatchedAt
+                    && $0.sources.contains(source.rawValue)
+            }) {
+                confirmedItems.append(local)
+                merged.removeAll { WatchedStore.sameContent($0.meta, local.meta)
+                    && $0.season == local.season && $0.episode == local.episode }
+                continue
+            }
             if let index = merged.firstIndex(where: { WatchedStore.sameContent($0.meta, local.meta) }) {
                 let remote = merged[index]
                 let sameEpisode = remote.season == local.season && remote.episode == local.episode
@@ -1756,10 +1771,12 @@ struct TraktProgressService {
                     // restarting an episode on another device is legitimate.
                     // Ignore remote snapshots whose timestamp is only marginally
                     // ahead of a local callback (clock skew / delayed scrobble).
-                    if remoteIsSubstantiallyNewer && remote.duration > 0 {
-                        // A newer percentage without a measured duration cannot
-                        // replace an exact second-based callback. Keep the
-                        // checkpoint until a comparable timeline exists.
+                    if remoteIsSubstantiallyNewer, remote.resumeProgressFraction != nil {
+                        // A genuinely later provider pause can be a rewind. Keep
+                        // it as a percentage; do not fabricate seconds for Infuse.
+                        merged[index] = remote
+                        confirmedItems.append(local)
+                    } else if remoteIsSubstantiallyNewer && remote.duration > 0 {
                         // User genuinely continued playback on another device.
                         // Inherit verified stream duration if remote has an estimated duration.
                         let resolvedDuration = local.duration > 100 ? local.duration : remote.duration
@@ -1829,9 +1846,11 @@ struct TraktProgressService {
 
     private static func pruneExpiredLocalCheckpoints() {
         let now = Date()
-        localPlaybackCheckpoints.removeAll {
-            now.timeIntervalSince($0.item.lastWatchedAt) > localCheckpointLifetime
+        let existing = localPlaybackCheckpoints
+        let retained = existing.filter {
+            $0.preservesExactPosition == true || now.timeIntervalSince($0.item.lastWatchedAt) <= localCheckpointLifetime
         }
+        if retained.count != existing.count { localPlaybackCheckpoints = retained }
     }
 
     private static func replaceContinueWatchingSnapshot(

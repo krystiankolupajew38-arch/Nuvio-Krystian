@@ -3259,6 +3259,7 @@ extension ContinueWatchingAndPlayerSyncTests {
             ExternalPlaybackCallback(id: session.id, isError: false, progress: 0.45, position: nil),
             profileID: session.profileID, defaults: defaults))
         XCTAssertEqual(ContinueWatchingStore.resumePosition(for: meta, season: 1, episode: 3), 1200)
+        XCTAssertNil(ExternalPlaybackSessionStore.load(defaults: defaults), "Superseded callbacks must not block future handoffs")
     }
 }
 

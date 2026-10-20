@@ -985,6 +985,7 @@ class PlayerViewModel: ObservableObject {
         )
         if !isActionPlaybackSession && !isTrailerPlayback && (resumeFrom ?? 0) <= 0,
            let fraction = resumeFraction, fraction.isFinite, fraction > 0, fraction < 0.9 {
+            pendingResumeSeconds = nil
             pendingResumeFraction = fraction
         }
         guard !hasLoaded else { return }
@@ -2138,6 +2139,7 @@ class PlayerViewModel: ObservableObject {
         if let episode, episode.id != currentEpisodeVideo?.id {
             availableSources = []
         }
+        let resumeFraction = episode == nil && (resumeFrom ?? 0) <= 0 ? pendingResumeFraction : nil
         applyStreamState(
             url: prepared.url,
             meta: meta,
@@ -2148,6 +2150,8 @@ class PlayerViewModel: ObservableObject {
             currentEpisode: episode ?? currentEpisodeVideo,
             preserveSessionPreferences: true
         )
+        pendingResumeFraction = resumeFraction
+        if resumeFraction != nil { pendingResumeSeconds = nil }
         self.activeAddonName = prepared.addonName
         self.activeProviderName = prepared.provider
         self.activeFilename = prepared.filename
