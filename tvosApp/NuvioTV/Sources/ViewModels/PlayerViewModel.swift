@@ -405,6 +405,7 @@ class PlayerViewModel: ObservableObject {
     /// Watching so the Home hero can say which episode is in progress.
     private var activeEpisodeNumbers: (season: Int, episode: Int)?
     private var pendingResumeSeconds: Double?
+    private var pendingResumeFraction: Double?
     private var didApplyResume = false
     var pendingExternalSubtitles: [NuvioSubtitle] = []
     private var didAddExternalSubtitles = false
@@ -902,6 +903,7 @@ class PlayerViewModel: ObservableObject {
         httpHeaders: [String: String] = [:],
         externalSubtitles: [NuvioSubtitle] = [],
         resumeFrom: Double?,
+        resumeFraction: Double? = nil,
         playbackOrigin: PlaybackOrigin = .main,
         bingeGroup: String? = nil,
         addonName: String? = nil,
@@ -981,6 +983,10 @@ class PlayerViewModel: ObservableObject {
             currentEpisode: currentEpisode,
             beginsNewPlaybackCompletionSession: !hasLoaded
         )
+        if !isActionPlaybackSession && !isTrailerPlayback && resumeFrom == nil,
+           let fraction = resumeFraction, fraction.isFinite, fraction > 0, fraction < 0.9 {
+            pendingResumeFraction = fraction
+        }
         guard !hasLoaded else { return }
         hasLoaded = true
 
@@ -1393,6 +1399,7 @@ class PlayerViewModel: ObservableObject {
         self.activeTrackSelectionKey = selectionKey
         self.pendingTrackSelection = effectiveSelection
         self.pendingResumeSeconds = isActionPlaybackSession || isLiveStream ? nil : resumeFrom
+        self.pendingResumeFraction = nil
         self.didApplyResume = false
         self.lastStablePlaybackTime = nil
         self.hasProducedMidFilePosition = false
@@ -6411,18 +6418,17 @@ class PlayerViewModel: ObservableObject {
         // The accepted room timeline owns Party startup; local history is not a user seek.
         guard watchPartyPlayerBridge == nil else { return }
         let minResumeThreshold = isTrailerPlaybackSession ? 0.5 : 5.0
-        guard !didApplyResume,
-              let pendingResumeSeconds,
-              pendingResumeSeconds > minResumeThreshold,
-              time.duration > 0 else {
-            return
-        }
+        guard !didApplyResume, time.duration > 0 else { return }
         guard !loadedStreamLooksLikeReplacement() else { return }
-
+        let targetSeconds = pendingResumeSeconds
+            ?? pendingResumeFraction.map { time.duration * $0 }
+        guard let targetSeconds, targetSeconds.isFinite,
+              targetSeconds > minResumeThreshold else { return }
         didApplyResume = true
+        pendingResumeFraction = nil
         let target = isTrailerPlaybackSession
-            ? min(pendingResumeSeconds, max(time.duration - 1, 0))
-            : min(pendingResumeSeconds, max(time.duration - 5, 0))
+            ? min(targetSeconds, max(time.duration - 1, 0))
+            : min(targetSeconds, max(time.duration - 5, 0))
         seek(to: target)
     }
 
