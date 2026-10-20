@@ -508,6 +508,9 @@ struct ExternalPlaybackSession: Codable, Equatable {
     var completionAccounts: [String: String]? = nil
     /// Source player identity; optional for previously saved in-flight sessions.
     var externalPlayerName: String? = nil
+    /// An acknowledged callback is saved before updating playback stores, so an
+    /// interrupted profile selection or failed write cannot lose its position.
+    var returnedCallback: ExternalPlaybackCallback? = nil
 
     /// Infuse documents position in seconds. Never invent a runtime for a
     /// percentage-only callback; that would manufacture a cross-device resume.
@@ -516,6 +519,9 @@ struct ExternalPlaybackSession: Codable, Equatable {
               !meta.isSeries || (season != nil && episode != nil),
               let runtime = callback.duration ?? duration,
               runtime.isFinite, runtime >= 60 else { return nil }
+        // Position is an absolute number of seconds, never a Trakt percentage.
+        // The caller stages it even if the saved runtime proves too short to be
+        // reliable; we must not silently clamp the episode to 100% watched.
         let position = callback.position ?? callback.progress.map { $0 * runtime }
         guard let position, position.isFinite,
               position >= WatchProgressLedger.minimumTrackableSeconds,
@@ -543,10 +549,34 @@ enum ExternalPlaybackSessionStore {
             startedAt: session.startedAt,
             progressSource: session.progressSource,
             completionAccounts: session.completionAccounts,
-            externalPlayerName: session.externalPlayerName
+            externalPlayerName: session.externalPlayerName,
+            returnedCallback: session.returnedCallback
         )
         guard let data = try? JSONEncoder().encode(compactSession) else { return }
         defaults.set(data, forKey: key)
+    }
+
+    /// Durable capture occurs as soon as iOS delivers the URL, even if the
+    /// profile gate is still showing. The callback is accepted only for the
+    /// current handoff and (for Infuse) the exact URL originally handed off.
+    @discardableResult
+    static func stage(_ callback: ExternalPlaybackCallback, defaults: UserDefaults = .standard) -> Bool {
+        guard var session = load(defaults: defaults),
+              session.id == callback.id,
+              session.returnedCallback == nil || session.returnedCallback == callback else { return false }
+        if session.externalPlayerName == ExternalPlayer.infuse.rawValue, !callback.isError {
+            guard let playedURL = callback.lastPlayedURL,
+                  playedURL == session.sourceURL,
+                  callback.position != nil else { return false }
+        }
+        guard callback.isError || (
+            callback.position.map { $0.isFinite && $0 >= WatchProgressLedger.minimumTrackableSeconds } == true
+            || callback.progress.map { $0.isFinite && $0 > 0 } == true
+        ) else { return false }
+        session.returnedCallback = callback
+        save(session, defaults: defaults)
+        // Confirm the durable write before treating the callback as captured.
+        return load(defaults: defaults)?.returnedCallback == callback
     }
 
     static func load(defaults: UserDefaults = .standard) -> ExternalPlaybackSession? {
@@ -581,7 +611,8 @@ enum ExternalPlaybackReturnHandler {
         persist: ((ExternalPlaybackSession, Double, Double) -> Bool)? = nil
     ) -> Bool {
         guard let session = ExternalPlaybackSessionStore.load(defaults: defaults),
-              session.id == callback.id, session.profileID == profileID else { return false }
+              session.id == callback.id, session.profileID == profileID,
+              ExternalPlaybackSessionStore.stage(callback, defaults: defaults) else { return false }
         if callback.isError {
             _ = ExternalPlaybackSessionStore.consume(id: session.id, profileID: session.profileID, defaults: defaults)
             return false
@@ -592,6 +623,16 @@ enum ExternalPlaybackReturnHandler {
         guard saved else { return false }
         _ = ExternalPlaybackSessionStore.consume(id: session.id, profileID: session.profileID, defaults: defaults)
         return true
+    }
+
+    /// Replay a captured result after relaunch or when the correct profile
+    /// becomes active. Nothing is invented if Infuse did not send a callback.
+    @discardableResult
+    static func recover(profileID: String?, defaults: UserDefaults = .standard) -> Bool {
+        guard let session = ExternalPlaybackSessionStore.load(defaults: defaults),
+              session.profileID == profileID,
+              let callback = session.returnedCallback else { return false }
+        return handle(callback, profileID: profileID, defaults: defaults)
     }
 
     private static func persistPlayback(_ session: ExternalPlaybackSession, position: Double, duration: Double) -> Bool {
@@ -611,6 +652,10 @@ enum ExternalPlaybackReturnHandler {
            WeTrakrProgressService.completionAccountID(in: store, profileId: profileID) != account { return false }
         let threshold = source == .mdblist && remote
             ? MdbListProgressService.completionPercent / 100 : WatchProgressLedger.completionFraction
+        // Metadata runtime is only a guess, particularly for TV series. An
+        // Infuse callback has no duration field; without a previously measured
+        // episode duration, its exact seconds are retained for retry rather
+        // than guessed into a watched completion.
         let completed = position / duration >= threshold
 
         // A later local or pulled sample wins over a delayed external return.
@@ -638,6 +683,7 @@ enum ExternalPlaybackReturnHandler {
                 session.meta, season: session.season, episode: session.episode,
                 completionID: session.id, source: source, completionAccounts: session.completionAccounts
             ) else { return false }
+            if session.externalPlayerName != ExternalPlayer.infuse.rawValue || source != .trakt {
             Task { @MainActor in
                 _ = await TraktProgressService.finishPlaybackForHistory(
                     meta: session.meta, position: position, duration: duration,
@@ -647,11 +693,16 @@ enum ExternalPlaybackReturnHandler {
                     traktMirrorAccountID: source == .trakt ? nil : session.completionAccounts?[TraktWatchProgressSource.trakt.rawValue]
                 )
             }
+            }
         } else if remote {
             guard TraktProgressService.recordLocalPlayback(
                 meta: session.meta, position: position, duration: duration,
                 season: session.season, episode: session.episode, source: source, notify: true
             ) else { return false }
+            // Infuse scrobbles to the user's Trakt account independently.
+            // Keep our immediate local checkpoint, but do not send a second
+            // competing pause position from Nuvio for the same episode.
+            if session.externalPlayerName != ExternalPlayer.infuse.rawValue || source != .trakt {
             Task { @MainActor in
                 guard ProfileSettings.activeProfileID == profileID, ProfileSettings.isActiveStore(store) else { return }
                 _ = await TraktProgressService.reportPlayback(
@@ -660,6 +711,7 @@ enum ExternalPlaybackReturnHandler {
                     store: store, sourceOverride: source,
                     expectedAccountID: session.completionAccounts?[source.rawValue], profileId: profileID
                 )
+            }
             }
         } else {
             guard ContinueWatchingStore.save(
