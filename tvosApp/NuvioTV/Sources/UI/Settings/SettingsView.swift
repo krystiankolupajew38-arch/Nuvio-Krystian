@@ -184,6 +184,7 @@ enum SettingsKey {
     static let hideUnreleased = "nuvio.tv.settings.layout.hideUnreleased"
     static let showFullDates = "nuvio.tv.settings.layout.showFullDates"
     static let detailsActionsBelowInfo = "nuvio.tv.settings.layout.detailsActionsBelowInfo"
+    static let blurUnwatchedEpisodes = "nuvio.tv.settings.details.blurUnwatchedEpisodes"
 
     static let traktConnected = "nuvio.tv.settings.integrations.traktConnected"
     static let traktClientID = "nuvio.tv.settings.integrations.traktClientID"
@@ -351,7 +352,7 @@ enum SettingsKey {
         searchStyle, preferAddonArtworkInSearch,
         continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp,
         cardCornerRadius, cardSize, liquidGlassCards,
-        hideUnreleased, showFullDates, detailsActionsBelowInfo,
+        hideUnreleased, showFullDates, detailsActionsBelowInfo, blurUnwatchedEpisodes,
         traktConnected, traktClientID, traktClientSecret,
         traktContinueWatchingDaysCap, traktShowMetaComments,
         traktWatchProgressSource, watchProgressSourceChosenByUser,
@@ -3071,6 +3072,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.focusedPosterBackdropEnabled) private var focusedPosterBackdropEnabled = true
     @AppStorage(SettingsKey.focusedPosterBackdropDelay) private var focusedPosterBackdropDelay = 3
     @AppStorage(SettingsKey.detailsActionsBelowInfo) private var detailsActionsBelowInfo = false
+    @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
 
     /// Classic was never a distinct layout (behaved like Modern).
     private let layouts = ["Modern", "Grid View", "Compact"]
@@ -3458,6 +3460,13 @@ private struct LayoutDiscoverySettingsView: View {
                         fallback: "Place the Play and action button row below the movie information and synopsis"
                     ),
                     isOn: $detailsActionsBelowInfo,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: "Blur Unwatched Episodes",
+                    subtitle: "Conceal scene spoilers in unwatched episode thumbnails. Episode titles and controls remain sharp.",
+                    isOn: $blurUnwatchedEpisodes,
                     accentColor: accentColor
                 )
             }
@@ -4648,6 +4657,7 @@ private struct TmdbOptionsSheet: View {
             .filter { $0 != .system }
             .map(\.nativeDisplayName)
         return [automaticTmdbLanguageLabel] + manualLanguages
+            + ["English (United States)", "English (United Kingdom)"]
     }
 
     private var tmdbHasApiKey: Bool {
@@ -4659,10 +4669,9 @@ private struct TmdbOptionsSheet: View {
     }
 
     private func normalizeTmdbApiKey() {
-        tmdbApiKey = tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tmdbHasApiKey {
-            tmdbEnabled = false
-        }
+        let trimmed = tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed != tmdbApiKey { tmdbApiKey = trimmed }
+        if trimmed.isEmpty && tmdbEnabled { tmdbEnabled = false }
     }
 
     private var tmdbLanguageSelection: Binding<String> {
@@ -4671,19 +4680,30 @@ private struct TmdbOptionsSheet: View {
                 if TmdbMetadataLanguage.followsApp(in: ProfileSettings.current) {
                     return automaticTmdbLanguageLabel
                 }
-                let language = AppLanguage.fromStored(tmdbLanguage)
-                return (language == .system ? AppLanguage.english : language).nativeDisplayName
+                switch TmdbMetadataLanguage.normalized(tmdbLanguage) {
+                case "en-US": return "English (United States)"
+                case "en-GB": return "English (United Kingdom)"
+                default:
+                    let language = AppLanguage.fromStored(tmdbLanguage)
+                    return (language == .system ? AppLanguage.english : language).nativeDisplayName
+                }
             },
             set: { displayName in
                 if displayName == automaticTmdbLanguageLabel {
                     tmdbFollowAppLanguage = true
                     return
                 }
-                let language = AppLanguage.pickerLanguages.first {
-                    $0 != .system && $0.nativeDisplayName == displayName
-                } ?? .english
-                tmdbLanguage = language.tag
-                tmdbFollowAppLanguage = false
+                let tag: String
+                switch displayName {
+                case "English (United States)": tag = "en-US"
+                case "English (United Kingdom)": tag = "en-GB"
+                default:
+                    tag = AppLanguage.pickerLanguages.first {
+                        $0 != .system && $0.nativeDisplayName == displayName
+                    }?.tag ?? "en"
+                }
+                if tmdbLanguage != tag { tmdbLanguage = tag }
+                if tmdbFollowAppLanguage { tmdbFollowAppLanguage = false }
             }
         )
     }
