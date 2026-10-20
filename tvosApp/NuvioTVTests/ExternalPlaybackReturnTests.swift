@@ -179,6 +179,25 @@ final class ExternalPlaybackReturnTests: XCTestCase {
         XCTAssertNil(ExternalPlaybackSessionStore.load(defaults: defaults))
     }
 
+    func testExplicitRemotePercentUsesRealStreamDurationForResume() {
+        let item = ContinueWatchingItem(
+            meta: NuvioMeta(id: "remote-percent-fixture", name: "Remote fixture", type: "series"),
+            streamUrl: "", position: 0, duration: 0, lastWatchedAt: Date(),
+            season: 1, episode: 2, explicitProgressPercent: 42
+        )
+        XCTAssertEqual(item.progress, 0.42, accuracy: 0.0001)
+        XCTAssertEqual(item.resumePosition, 0)
+        XCTAssertEqual(item.resumeProgressFraction ?? 0, 0.42, accuracy: 0.0001)
+        // The loaded file duration, not show metadata, supplies the seek time.
+        XCTAssertEqual(3_000 * (item.resumeProgressFraction ?? 0), 1_260, accuracy: 0.01)
+        let exact = ContinueWatchingItem(
+            meta: item.meta, streamUrl: "", position: 1_200, duration: 0,
+            lastWatchedAt: Date(), season: 1, episode: 2
+        )
+        XCTAssertEqual(exact.resumePosition, 1_200)
+        XCTAssertNil(exact.resumeProgressFraction)
+    }
+
     @MainActor
     func testExternalErrorRetiresSessionWithoutWritingProgress() {
         let suite = "external-return-error-test"
