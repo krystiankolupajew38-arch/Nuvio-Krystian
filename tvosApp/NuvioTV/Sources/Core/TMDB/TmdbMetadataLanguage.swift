@@ -27,11 +27,14 @@ enum TmdbMetadataLanguage {
         // TMDB accepts regional BCP-47 codes independently of the app's UI
         // language list. Do not collapse the device's en-GB to generic en.
         let deviceTag = normalized(systemLanguage)
+        // Existing automatic choices continue to use the app-supported base
+        // language, with the explicit regional English TMDB variants retained.
+        if deviceTag == "en-GB" || deviceTag == "en-US" { return deviceTag }
         let exact = AppLanguage.fromStored(deviceTag)
         if exact != .system { return normalized(exact.tag) }
         let base = deviceTag.split(separator: "-").first.map(String.init) ?? "en"
         let supported = AppLanguage.fromStored(base)
-        return supported == .system ? "en" : deviceTag
+        return supported == .system ? "en" : normalized(supported.tag)
     }
 
     static func selectAutomatic(in store: UserDefaults) {
