@@ -1572,8 +1572,9 @@ struct ContentView: View {
                 season: meta.isSeries ? numbers?.season : nil,
                 episode: meta.isSeries ? numbers?.episode : nil,
                 // A show-wide runtime is not a verified episode duration.
-                duration: priorProgress.flatMap { $0.duration >= 60 ? $0.duration : nil }
-                    ?? (meta.isSeries ? nil : Self.runtimeSeconds(meta.runtime)),
+                // Only an already-measured per-title duration is eligible
+                // for completion. Generic metadata runtime is an estimate.
+                duration: priorProgress.flatMap { $0.duration >= 60 ? $0.duration : nil },
                 profileID: profileID,
                 collectionContext: provenance,
                 startedAt: Date(),
