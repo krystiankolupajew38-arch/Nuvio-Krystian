@@ -115,18 +115,15 @@ final class KrystianReleaseAndSpoilerTests: XCTestCase {
     }
 
     func testBuiltInCinemetaStaysOffWhenOnlyCustomManifestEnabled() {
-        let store = UserDefaults(suiteName: "krystian-addon-\(UUID().uuidString)")!
-        defer { store.removePersistentDomain(forName: storeSuiteName(store)) }
+        let suite = "krystian-addon-\(UUID().uuidString)"
+        let store = UserDefaults(suiteName: suite)!
+        defer { store.removePersistentDomain(forName: suite) }
         // An enabled non-Cinemeta add-on means the built-in is not implicit.
         let custom = [CinemetaCatalogRepository.StreamAddonPreference(
             url: "https://metadata.example.test/manifest.json", enabled: true
         )]
         CinemetaCatalogRepository.setConfiguredStreamAddonPreferences(custom, in: store)
         XCTAssertFalse(CinemetaCatalogRepository.isCinemetaEnabled(in: store))
-    }
-
-    private func storeSuiteName(_ store: UserDefaults) -> String {
-        store.volatileDomainNames.first(where: { $0.hasPrefix("krystian-addon-") }) ?? ""
     }
 
     func testBlurOnlyEpisodeArtworkAndOnlyWhenUnwatched() {
