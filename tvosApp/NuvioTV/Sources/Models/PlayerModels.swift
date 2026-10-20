@@ -525,7 +525,10 @@ struct ExternalPlaybackSession: Codable, Equatable {
         }
         guard let position, position.isFinite,
               position >= WatchProgressLedger.minimumTrackableSeconds else { return nil }
-        guard let runtime, runtime.isFinite, runtime >= 60 else { return nil }
+        // A duration shorter than the callback position is untrustworthy.
+        // Keep the staged position; never fabricate a completed watch.
+        guard let runtime, runtime.isFinite, runtime >= 60,
+              position <= runtime else { return nil }
         return (position, runtime)
     }
 }
