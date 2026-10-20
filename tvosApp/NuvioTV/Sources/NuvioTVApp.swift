@@ -4344,6 +4344,7 @@ struct TVHomeView: View {
     @State private var localTitlesSection: TVHomeSection?
     @State private var jellyfinSection: TVHomeSection?
     @State private var isLoading = true
+    @State private var initialProgressRefreshFinished = false
     @State private var profileGateFailedLoadIdentity: TVHomeContentIdentity?
     @State private var focusedMeta: NuvioMeta?
     /// Collection folder currently focused on Home. When set, the hero shows
@@ -4749,12 +4750,33 @@ struct TVHomeView: View {
             let inputsChanged = repository.homeCatalogInputSignature != lastLoadedInputSignature
             await loadWithAutomaticRetry(for: contentIdentity, forceReload: !isLoaded || inputsChanged)
             if !isLoaded, collectionHome == nil {
-                // Add-on metadata providers are configured by the time Home has
-                // loaded, so this is the pass that recovers titles an earlier sync
-                // could not resolve. Mirrors the phone's
-                // `retryMetadataResolutionWhenAddonMetaProvidersReady`.
-                ContinueWatchingBuilder.scheduleRebuild(reason: "home loaded")
+                // Catalog loading has configured the metadata providers; fill
+                // any remaining episode details using those providers.
                 await ContinueWatchingStore.refreshMissingEpisodeDetails()
+            }
+        }
+        .task(id: "\(contentIdentity.profileId):\(store.hasPresentedHome)") {
+            guard collectionHome == nil, !store.hasPresentedHome else { return }
+            var gate = TVHomeStartupGate()
+            let clock = ContinuousClock()
+            let started = clock.now
+            while !Task.isCancelled {
+                let progressReady = !continueWatchingVisible || (
+                    initialProgressRefreshFinished
+                    && NuvioSyncManager.current?.isHomePullPending != true
+                    && !ContinueWatchingBuilder.isRebuildPending
+                )
+                let elapsed = started.duration(to: clock.now).components
+                if gate.update(
+                    elapsed: Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18,
+                    isReady: !isLoading && progressReady
+                ) {
+                    refreshContinueWatching()
+                    store.hasPresentedHome = true
+                    return
+                }
+                do { try await Task.sleep(for: .milliseconds(100)) }
+                catch { return }
             }
         }
         .task(id: "\(contentIdentity.profileId):\(collectionsRevision)") {
@@ -5075,11 +5097,10 @@ struct TVHomeView: View {
     var body: some View {
         let _ = TVHomeDebugTrace.breadcrumb("home.body.render active=\(isActive) row=\(focusedRowIndex)")
         homeBodySecondHalf
-        .onChange(of: isLoading) { _, loading in
-            TVHomeDebugTrace.log("home.onChange(isLoading) loading=\(loading) showsLoading=\(showsLoading)")
-            if loading && showsLoading {
+        .onChange(of: showsLoading) { _, loading in
+            if loading {
                 requestLoadingFocus()
-            } else if !loading || !showsLoading {
+            } else {
                 isLoadingFocusActive = false
             }
         }
@@ -5845,9 +5866,7 @@ struct TVHomeView: View {
     /// load. When returning from a card the sections are already cached in the
     /// store, so we render them straight away instead of flashing the spinner.
     private var showsLoading: Bool {
-        // Account progress is available before the add-on catalog requests
-        // finish. Do not cover a ready Continue Watching row with the global
-        // spinner while BetterPosters (or another large add-on) is loading.
+        if collectionHome == nil { return !store.hasPresentedHome }
         return isLoading
             && store.sections.isEmpty
             && continueWatching.isEmpty
@@ -5898,6 +5917,9 @@ struct TVHomeView: View {
             return .waiting(hasFocusableContent: false, targetSignature: nil)
         }
         if isFullScreenOverlayPresented { return .overlay }
+        guard !showsLoading else {
+            return .waiting(hasFocusableContent: false, targetSignature: nil)
+        }
         let target = profileGateStartupFocusTarget
         if let target {
             return .ready(
@@ -7231,6 +7253,11 @@ struct TVHomeView: View {
             )
             store.finishLoad(generation, for: identity)
             lastLoadedInputSignature = inputSignature
+            // Arm this before clearing isLoading: a partial catalog retry can
+            // otherwise reveal Home before the metadata recovery pass starts.
+            if !store.hasPresentedHome {
+                ContinueWatchingBuilder.scheduleRebuild(reason: "home loaded")
+            }
             refreshContinueWatching()
             refreshWatchedTitles()
             isLoading = false
@@ -8300,6 +8327,7 @@ struct TVHomeView: View {
     private func refreshContinueWatchingFromSelectedSource() async {
         guard collectionHome == nil else { return }
         continueWatchingRefreshGeneration &+= 1
+        if !store.hasPresentedHome { initialProgressRefreshFinished = false }
         let generation = continueWatchingRefreshGeneration
         let profileID = ContinueWatchingStore.activeProfileId
         let source = selectedProgressSource
@@ -8311,6 +8339,12 @@ struct TVHomeView: View {
             finishSimklHomeLoadingDiagnostic()
         }
         defer {
+            if !Task.isCancelled,
+               generation == continueWatchingRefreshGeneration,
+               profileID == ContinueWatchingStore.activeProfileId,
+               source == selectedProgressSource {
+                initialProgressRefreshFinished = true
+            }
             if isSimklRefresh, generation == continueWatchingRefreshGeneration {
                 finishSimklHomeLoadingDiagnostic()
             }
@@ -9748,6 +9782,8 @@ final class TVHomeStore: ObservableObject {
         didSet { sectionsRevision &+= 1 }
     }
     @Published var sectionsRevision: UInt = 0
+    /// A mounted Home is revealed once; background reloads never cover it again.
+    @Published var hasPresentedHome = false
     @Published var hero: NuvioMeta?
     @Published var lastLoadedAt: Date?
     /// True when any last-known-good tree is available. Cache reuse additionally
@@ -9772,6 +9808,7 @@ final class TVHomeStore: ObservableObject {
         let previousProfileId = loadedContentIdentity?.profileId
             ?? loadingContentIdentity?.profileId
         if let previousProfileId, previousProfileId != identity.profileId {
+            hasPresentedHome = false
             sections = []
             hero = nil
             lastFocusedCardID = nil
@@ -9813,6 +9850,7 @@ final class TVHomeStore: ObservableObject {
 
     func reset() {
         loadGeneration &+= 1
+        hasPresentedHome = false
         sections = []
         hero = nil
         hasLoaded = false

@@ -31,6 +31,17 @@ enum ContinueWatchingBuilder {
     private static var rebuildTask: Task<Void, Never>?
     private static var generation: UInt = 0
 
+    static var isRebuildPending: Bool {
+        lock.withLock { rebuildTask != nil }
+    }
+
+    private static func finishScheduledRebuild(_ expectedGeneration: UInt) {
+        lock.withLock {
+            guard generation == expectedGeneration else { return }
+            rebuildTask = nil
+        }
+    }
+
     private static func nextGeneration() -> UInt {
         lock.lock()
         defer { lock.unlock() }
@@ -192,6 +203,7 @@ enum ContinueWatchingBuilder {
         generation &+= 1
         let gen = generation
         let task = Task.detached(priority: .utility) {
+            defer { finishScheduledRebuild(gen) }
             if delayMs > 0 {
                 try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
             }
