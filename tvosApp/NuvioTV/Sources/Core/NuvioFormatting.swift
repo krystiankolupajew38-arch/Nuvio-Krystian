@@ -17,7 +17,9 @@ enum NuvioDateDisplay {
             return "TBD"
         }
 
-        let datePart = String(raw.prefix(10))
+        // Exact timestamps follow the device timezone. Date-only source
+        // values remain calendar dates, rather than assumed midnight UTC.
+        let datePart = EpisodeReleasePolicy.localReleaseDay(raw) ?? String(raw.prefix(10))
         if !showsFullDates {
             let year = String(datePart.prefix(4))
             return Int(year) == nil ? raw : year
