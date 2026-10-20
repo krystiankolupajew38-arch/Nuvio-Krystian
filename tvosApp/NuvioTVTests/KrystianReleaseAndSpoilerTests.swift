@@ -119,7 +119,7 @@ final class KrystianReleaseAndSpoilerTests: XCTestCase {
         let store = UserDefaults(suiteName: suite)!
         defer { store.removePersistentDomain(forName: suite) }
         // An enabled non-Cinemeta add-on means the built-in is not implicit.
-        let custom = [CinemetaCatalogRepository.StreamAddonPreference(
+        let custom = [StreamAddonPreference(
             url: "https://metadata.example.test/manifest.json", enabled: true
         )]
         CinemetaCatalogRepository.setConfiguredStreamAddonPreferences(custom, in: store)
