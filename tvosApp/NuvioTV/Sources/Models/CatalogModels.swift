@@ -1068,7 +1068,9 @@ enum EpisodeReleasePolicy {
         if isAiringToday(released) {
             return L10n.string("date_today", fallback: "Today")
         }
-        return NuvioDateDisplay.formattedDate(released) ?? released.prefix(10).description
+        let localDay = localReleaseDay(released)
+        return localDay.flatMap { NuvioDateDisplay.formattedDate($0) }
+            ?? localDay ?? released
     }
 
     /// True when `released` is a real timestamp within the last `days` days.
