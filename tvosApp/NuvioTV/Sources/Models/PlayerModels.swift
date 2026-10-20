@@ -451,12 +451,14 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
 }
 
 /// The callback returned by Infuse after an external playback handoff.
-struct ExternalPlaybackCallback: Equatable {
+struct ExternalPlaybackCallback: Equatable, Codable {
     let id: String
     let isError: Bool
     let progress: Double?
     let position: Double?
     var duration: Double? = nil
+    /// Infuse supplies the played URL with a successful x-callback.
+    var lastPlayedURL: String? = nil
 
     static func parse(_ url: URL) -> ExternalPlaybackCallback? {
         guard url.scheme?.lowercased() == "nuvio-krystian",
@@ -483,7 +485,8 @@ struct ExternalPlaybackCallback: Equatable {
             isError: isError,
             progress: progress,
             position: number("position"),
-            duration: number("duration")
+            duration: number("duration"),
+            lastPlayedURL: query.first(where: { $0.name == "lastPlayedUrl" })?.value
         )
     }
 }
@@ -503,6 +506,8 @@ struct ExternalPlaybackSession: Codable, Equatable {
     var startedAt: Date? = nil
     var progressSource: String? = nil
     var completionAccounts: [String: String]? = nil
+    /// Source player identity; optional for previously saved in-flight sessions.
+    var externalPlayerName: String? = nil
 
     /// Infuse documents position in seconds. Never invent a runtime for a
     /// percentage-only callback; that would manufacture a cross-device resume.
@@ -537,7 +542,8 @@ enum ExternalPlaybackSessionStore {
             collectionContext: session.collectionContext,
             startedAt: session.startedAt,
             progressSource: session.progressSource,
-            completionAccounts: session.completionAccounts
+            completionAccounts: session.completionAccounts,
+            externalPlayerName: session.externalPlayerName
         )
         guard let data = try? JSONEncoder().encode(compactSession) else { return }
         defaults.set(data, forKey: key)
