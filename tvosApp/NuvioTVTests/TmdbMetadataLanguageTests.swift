@@ -21,6 +21,27 @@ final class TmdbMetadataLanguageTests: XCTestCase {
         }
     }
 
+    func testExplicitRegionalEnglishChoicesRoundTripWithoutCollapsingToGenericEnglish() {
+        withDefaults { store in
+            for tag in ["en", "en-US", "en-GB"] {
+                TmdbMetadataLanguage.selectManual(tag, in: store)
+                XCTAssertEqual(TmdbMetadataLanguage.resolvedLanguage(in: store), tag)
+                XCTAssertEqual(store.string(forKey: SettingsKey.tmdbLanguage), tag)
+                XCTAssertFalse(TmdbMetadataLanguage.followsApp(in: store))
+            }
+            TmdbMetadataLanguage.selectAutomatic(in: store)
+            store.set("", forKey: SettingsKey.language)
+            XCTAssertEqual(
+                TmdbMetadataLanguage.resolvedLanguage(in: store, systemLanguage: "en-GB"),
+                "en-GB"
+            )
+            XCTAssertEqual(
+                TmdbMetadataLanguage.resolvedLanguage(in: store, systemLanguage: "en-US"),
+                "en-US"
+            )
+        }
+    }
+
     func testLegacySavedEnglishRemainsManual() {
         withDefaults { store in
             store.set("en", forKey: SettingsKey.tmdbLanguage)
