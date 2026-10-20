@@ -8119,6 +8119,7 @@ private struct TvStreamPickerOverlay: View {
         // Preserve completed cards as add-ons publish progressively. Larger
         // batches reduce whole-overlay SwiftUI invalidations while still giving
         // cancellation a chance between chunks when a new revision arrives.
+        var stagedPresentations = streamCardPresentations
         for startIndex in stride(from: 0, to: missingStreams.count, by: 16) {
             guard !Task.isCancelled else { return }
             let endIndex = min(startIndex + 16, missingStreams.count)
@@ -8129,9 +8130,10 @@ private struct TvStreamPickerOverlay: View {
             )
             guard !Task.isCancelled,
                   cacheKey == streamCardPresentationCacheKey else { return }
-            var updatedPresentations = streamCardPresentations
-            updatedPresentations.merge(batchPresentations) { _, new in new }
-            streamCardPresentations = updatedPresentations
+            stagedPresentations.merge(batchPresentations) { _, new in new }
+            if startIndex == 0 || endIndex % 64 == 0 || endIndex == missingStreams.count {
+                streamCardPresentations = stagedPresentations
+            }
         }
     }
 
