@@ -983,7 +983,7 @@ class PlayerViewModel: ObservableObject {
             currentEpisode: currentEpisode,
             beginsNewPlaybackCompletionSession: !hasLoaded
         )
-        if !isActionPlaybackSession && !isTrailerPlayback && resumeFrom == nil,
+        if !isActionPlaybackSession && !isTrailerPlayback && (resumeFrom ?? 0) <= 0,
            let fraction = resumeFraction, fraction.isFinite, fraction > 0, fraction < 0.9 {
             pendingResumeFraction = fraction
         }
