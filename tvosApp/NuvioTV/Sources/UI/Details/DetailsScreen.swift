@@ -7800,6 +7800,9 @@ private struct TvStreamPickerOverlay: View {
     /// never when focus moves between cards.
     @State private var displayedStreams: [NuvioStream] = []
     @State private var displayedStreamsCacheKey: StreamPickerListCacheKey?
+    /// Reuse recent add-on/sort results while the repository revision is unchanged.
+    /// The bounded cache avoids repeated regex-heavy work when switching chips.
+    @State private var recentDisplayedStreamLists: [(key: StreamPickerListCacheKey, streams: [NuvioStream])] = []
     /// Number of streams currently materialized in the picker list for lazy loading.
     @State private var visibleStreamLimit: Int = StreamPickerListBuilder.defaultPageSize
     /// Badge matching is regex-heavy, so derive it with the stream-list cache
@@ -8064,10 +8067,27 @@ private struct TvStreamPickerOverlay: View {
     private func refreshDisplayedStreamsIfNeeded() async {
         let key = listCacheKey
         guard key != displayedStreamsCacheKey else { return }
-        let refreshedStreams = await StreamPickerListWorker.shared.build(
-            streams: streams, groups: groups, key: key
-        )
+        // Never reuse results from a previous fetch/refresh, even if the IDs
+        // happen to be unchanged: source metadata and availability can change.
+        recentDisplayedStreamLists.removeAll { $0.key.revision != key.revision }
+        let cachedStreams = recentDisplayedStreamLists.first { $0.key == key }?.streams
+        let refreshedStreams: [NuvioStream]
+        if let cachedStreams {
+            refreshedStreams = cachedStreams
+        } else {
+            refreshedStreams = await StreamPickerListWorker.shared.build(
+                streams: streams, groups: groups, key: key
+            )
+        }
         guard !Task.isCancelled, key == listCacheKey, pickerIsVisible else { return }
+        if cachedStreams == nil && refreshedStreams.count <= 1_200 {
+            // Cap both entry count and list size to avoid retaining several
+            // extremely large add-on results on memory-constrained Apple TVs.
+            recentDisplayedStreamLists.insert((key: key, streams: refreshedStreams), at: 0)
+            if recentDisplayedStreamLists.count > 3 {
+                recentDisplayedStreamLists.removeLast(recentDisplayedStreamLists.count - 3)
+            }
+        }
         let sameFilter = displayedStreamsCacheKey.map { previous in
             previous.selectedAddonId == key.selectedAddonId
                 && previous.sortOption == key.sortOption
