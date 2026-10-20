@@ -4401,6 +4401,7 @@ struct TVHomeView: View {
     /// Add-on/catalog settings the last completed load actually read.
     @State private var lastLoadedInputSignature: String?
     @State private var rawContinueWatchingItems: [ContinueWatchingItem] = []
+    @State private var lastReleaseEligibilitySignature: String?
     @State private var appliedContinueWatchingSort: String?
     @State private var continueWatching: [ContinueWatchingItem] = []
     @State private var upcomingItems: [ContinueWatchingItem] = []
@@ -4782,7 +4783,7 @@ struct TVHomeView: View {
                     .allowsHitTesting(false)
             }
         }
-        .task(id: "\(contentIdentity.profileId):\(contentIdentity.catalogRevision):\(tmdbHomeSettingsKey):\(collectionHome == nil || isActive)") {
+        .task(id: "\(contentIdentity.profileId):\(contentIdentity.catalogRevision):\(tmdbHomeSettingsKey)") {
             guard collectionHome == nil || isActive else { return }
             focusWork.heroEnrichmentTask?.cancel()
             focusWork.enrichedHeroMetadata.removeAll()
@@ -4860,8 +4861,12 @@ struct TVHomeView: View {
             if homeLayout == "Classic" { homeLayout = "Modern" }
             refreshContinueWatching()
             refreshWatchedTitles()
-            scheduleContinueWatchingRefresh()
-            scheduleTraktWatchedHistorySync()
+            // A returning tab must not refetch progress just because it remounted.
+            // First load / a changed progress source still needs initial data.
+            if !initialProgressRefreshFinished || displayedProgressSource != selectedProgressSource {
+                scheduleContinueWatchingRefresh()
+                scheduleTraktWatchedHistorySync()
+            }
         }
         // Home stays mounted behind Details/Player, so `onAppear` no longer
         // fires on return. Refresh the Continue Watching row whenever the store
@@ -4966,10 +4971,16 @@ struct TVHomeView: View {
                         }
                     }
                 }
-                if usesRemoteProgress {
+                // Keep existing rows and their scroll/focus state. Progress
+                // notifications, profile/provider changes and freshness policies
+                // perform real refreshes; tab visibility alone does not.
+                if !initialProgressRefreshFinished || displayedProgressSource != selectedProgressSource {
                     scheduleContinueWatchingRefresh()
-                } else {
+                } else if !usesRemoteProgress {
                     refreshContinueWatching()
+                }
+                if !rawContinueWatchingItems.isEmpty {
+                    setContinueWatching(rawContinueWatchingItems)
                 }
                 #if DEBUG
                 logRowWindow("home became active")
@@ -5185,7 +5196,19 @@ struct TVHomeView: View {
         }
         .onChange(of: isActive) { oldVal, active in
             if !oldVal && active && !isFullScreenOverlayPresented {
+                // Catalog refresh is TTL-based, not a side effect of switching
+                // tabs. This call is a no-op unless the configured TTL expired.
                 checkAndTriggerAutoRefresh()
+            }
+        }
+        // Local status can cross midnight or an exact release instant while
+        // Home remains visible. No network call or card clearing is required.
+        .task(id: contentIdentity.profileId) {
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(30)) }
+                catch { return }
+                guard !Task.isCancelled, isActive, !rawContinueWatchingItems.isEmpty else { continue }
+                setContinueWatching(rawContinueWatchingItems)
             }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -8186,13 +8209,16 @@ struct TVHomeView: View {
     /// Publish Continue Watching and derived lookups together, outside body.
     private func setContinueWatching(_ rawItems: [ContinueWatchingItem]) {
         refreshContinueWatchingOrigins(rawItems)
+        let eligibilitySignature = rawItems.map {
+            "\($0.meta.id)|\($0.season ?? -1):\($0.episode ?? -1)|\($0.hasAired)|\($0.isAiringToday)|\($0.isNewEpisodeDrop)"
+        }.joined(separator: ";")
         if appliedContinueWatchingSort == continueWatchingSort,
+           lastReleaseEligibilitySignature == eligibilitySignature,
            rawContinueWatchingItems.count == rawItems.count {
             let isIdentical = zip(rawContinueWatchingItems, rawItems).allSatisfy { $0.isContentEqual(to: $1) }
-            if isIdentical {
-                return
-            }
+            if isIdentical { return }
         }
+        lastReleaseEligibilitySignature = eligibilitySignature
         appliedContinueWatchingSort = continueWatchingSort
         rawContinueWatchingItems = rawItems
         let (items, upcoming): ([ContinueWatchingItem], [ContinueWatchingItem]) = {
