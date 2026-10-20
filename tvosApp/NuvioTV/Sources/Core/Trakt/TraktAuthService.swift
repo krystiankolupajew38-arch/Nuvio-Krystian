@@ -2248,10 +2248,11 @@ struct TraktProgressService {
         if meta.id.isEmpty {
             meta = placeholderMeta(for: seed)
         }
-        let duration = runtimeSeconds(for: meta)
-        let position = seed.isUpNext
-            ? 1.0
-            : max(1.0, duration * seed.progressPercent / 100.0)
+        // Preserve the upstream percentage as-is. A show-wide runtime isn't
+        // evidence of the episode's length; the built-in player converts this
+        // fraction only after its actual stream duration becomes available.
+        let duration = 0.0
+        let position = seed.isUpNext ? 1.0 : 0.0
 
         return ContinueWatchingItem(
             meta: meta,
@@ -2266,7 +2267,8 @@ struct TraktProgressService {
             episodeOverviewOverride: episodeOverview,
             episodeThumbnailOverride: episodeThumbnail,
             isUpNext: seed.isUpNext,
-            upNextSeedSeason: seed.isUpNext ? seedSeason : nil
+            upNextSeedSeason: seed.isUpNext ? seedSeason : nil,
+            explicitProgressPercent: seed.isUpNext ? nil : seed.progressPercent
         )
     }
 
