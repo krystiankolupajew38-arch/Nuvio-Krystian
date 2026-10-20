@@ -1,6 +1,6 @@
 # Nuvio - Krystian
 
-Personal Apple TV development fork of [bobsupra/NuvioTVOS](https://github.com/bobsupra/NuvioTVOS). The upstream license and attribution are retained.
+Personal Apple TV development fork of [bobsupra/NuvioTVOS](https://github.com/bobsupra/NuvioTVOS). The upstream license and attribution are retained. Your repository is [krystiankolupajew38-arch/Nuvio-Krystian](https://github.com/krystiankolupajew38-arch/Nuvio-Krystian).
 
 ## App identity
 
@@ -19,6 +19,17 @@ Local app data is separate. Signing in to the same Nuvio account can still sync 
 ## Open and build
 
 The generated workspace is `tvosApp/NuvioTV.xcworkspace`. Open it in Xcode, select the **NuvioTV** scheme, choose your Apple TV, then Run.
+
+To build, install, and launch from Terminal:
+
+```sh
+xcrun devicectl list devices
+./scripts/krystian-deploy.sh <Apple-TV-device-ID>
+```
+
+The deploy script puts build output in `~/Library/Developer/Xcode/DerivedData/Nuvio-Krystian`. Keep signed build output outside synced Documents folders: file-provider metadata can cause code-signing failures. Xcode's default Derived Data location is suitable too.
+
+The initial Personal Team provisioning expires on 26 October 2026 at 23:57 UK time, as recorded in the embedded profile. Rebuild and deploy to renew it; there is no automatic refresh configured for this fork.
 
 To regenerate after project changes:
 
@@ -42,7 +53,7 @@ This fork omits upstream's push-notification, associated-domain, and iCloud key-
 
 ## Development workflow
 
-`upstream` points to bobsupra/NuvioTVOS. Once your GitHub fork exists, `origin` should point to your own repository. Keep personal changes on `main`, and create a branch per feature:
+`upstream` points to bobsupra/NuvioTVOS; its push URL is disabled in this checkout to prevent accidental upstream pushes. `origin` points to your own repository. Keep personal changes on `main`, and create a branch per feature:
 
 ```sh
 git switch -c feature/short-description
@@ -83,4 +94,11 @@ The inherited CI configuration uses a custom `xcode-27` runner; it is not ready 
 - If App Groups are available, verify a Top Shelf item opens the new app.
 - Confirm the original app still opens and its refresh process remains unchanged.
 
-Build, signing, and device-install results should be recorded after verification; creating this workspace alone does not establish that these checks pass.
+## Verified setup — 20 October 2026
+
+- Tuist 4.207.0 generated the workspace successfully.
+- Xcode 27.1 built the tvOS app successfully, unsigned and then signed.
+- The signed `com.krystian.nuvio` app installed successfully on the paired Apple TV.
+- Property lists and shell-script syntax passed validation.
+- Launch was attempted, but Apple TV refused because it was asleep; launch and playback remain unverified.
+- Automated unit tests and account-dependent playback checks have not yet been run.

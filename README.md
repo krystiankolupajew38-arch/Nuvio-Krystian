@@ -1,3 +1,11 @@
+# Nuvio - Krystian
+
+Personal Apple TV development fork. Start with [the project guide](KRYSTIAN.md) for Xcode setup, device deployment, and the Git workflow. This fork installs as `com.krystian.nuvio` alongside the original app.
+
+The upstream documentation below describes the original project; linked upstream release downloads do not contain Krystian’s customizations.
+
+---
+
 <div align="center">
 
   <img src="https://github.com/tapframe/NuvioTV/blob/main/assets/brand/app_logo_wordmark.png" alt="Nuvio" width="300" />
