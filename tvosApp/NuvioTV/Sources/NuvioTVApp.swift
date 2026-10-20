@@ -700,6 +700,7 @@ struct ContentView: View {
             case .active:
                 syncManager.refreshAccountIfIdle()
                 presentProfileSelectionAfterBackgroundIfNeeded()
+                recoverExternalPlaybackReturnIfPossible()
                 watchPartyOwner.resumeAfterForeground()
             default:
                 break
@@ -963,6 +964,7 @@ struct ContentView: View {
         // generic id guard: callback URLs intentionally carry only a session
         // UUID, not a title id.
         if let callback = ExternalPlaybackCallback.parse(url) {
+            guard ExternalPlaybackSessionStore.stage(callback) else { return }
             switch activeScreen {
             case .login, .profileSelection:
                 pendingDeepLinkURL = url
@@ -1018,6 +1020,16 @@ struct ContentView: View {
     private func handleExternalPlaybackCallback(_ callback: ExternalPlaybackCallback) {
         ExternalPlaybackReturnHandler.handle(
             callback, profileID: profileViewModel.activeProfile?.id ?? WatchedStore.activeProfileId
+        )
+    }
+
+    private func recoverExternalPlaybackReturnIfPossible() {
+        switch activeScreen {
+        case .login, .profileSelection: return
+        default: break
+        }
+        _ = ExternalPlaybackReturnHandler.recover(
+            profileID: profileViewModel.activeProfile?.id ?? WatchedStore.activeProfileId
         )
     }
 
@@ -1547,13 +1559,15 @@ struct ContentView: View {
                 sourceURL: url.absoluteString,
                 season: meta.isSeries ? numbers?.season : nil,
                 episode: meta.isSeries ? numbers?.episode : nil,
-                duration: priorProgress.flatMap { $0.duration > 0 ? $0.duration : nil }
-                    ?? Self.runtimeSeconds(meta.runtime),
+                // A show-wide runtime is not a verified episode duration.
+                duration: priorProgress.flatMap { $0.duration >= 60 ? $0.duration : nil }
+                    ?? (meta.isSeries ? nil : Self.runtimeSeconds(meta.runtime)),
                 profileID: profileID,
                 collectionContext: provenance,
                 startedAt: Date(),
                 progressSource: source.rawValue,
-                completionAccounts: completionAccounts
+                completionAccounts: completionAccounts,
+                externalPlayerName: player.rawValue
             )
             successCallback = URL(string: "nuvio-krystian://external-playback/\(id)")
             errorCallback = URL(string: "nuvio-krystian://external-playback/error/\(id)")
@@ -1589,7 +1603,13 @@ struct ContentView: View {
             if let externalSession {
                 ExternalPlaybackSessionStore.save(externalSession)
             }
-            UIApplication.shared.open(launchURL, options: [:], completionHandler: nil)
+            UIApplication.shared.open(launchURL, options: [:]) { opened in
+                if !opened, let externalSession {
+                    _ = ExternalPlaybackSessionStore.consume(
+                        id: externalSession.id, profileID: externalSession.profileID
+                    )
+                }
+            }
             return
         }
 
