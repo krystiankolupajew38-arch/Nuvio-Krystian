@@ -1322,6 +1322,20 @@ struct TraktProgressService {
             .items.first(where: { WatchedStore.sameContent($0.meta, meta) })
     }
 
+    /// Publish the already-persisted local position synchronously on Home.
+    /// A provider fetch may take seconds and must not be the first update.
+    static func immediateContinueWatchingItems(
+        source: TraktWatchProgressSource,
+        profileId: String?
+    ) -> [ContinueWatchingItem] {
+        let remote = continueWatchingSnapshots.first {
+            $0.profileId == profileId && $0.source == source
+        }?.items ?? []
+        return mergingLocalPlaybackCheckpoints(
+            into: remote, source: source, profileId: profileId
+        )
+    }
+
     @discardableResult
     static func recordLocalPlayback(
         meta: NuvioMeta,
