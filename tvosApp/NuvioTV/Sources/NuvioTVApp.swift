@@ -4803,6 +4803,11 @@ struct TVHomeView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification).receive(on: RunLoop.main)) { _ in
             guard collectionHome == nil else { return }
+            // Local Infuse callbacks are already durable. Show them immediately
+            // before the provider refresh, even beneath a Details overlay.
+            if usesRemoteProgress {
+                refreshRemoteContinueWatchingImmediately()
+            }
             guard isActive else { return }
             if isFullScreenOverlayPresented {
                 pendingContinueWatchingRefreshAfterOverlay = true
@@ -8228,6 +8233,22 @@ struct TVHomeView: View {
             refreshContinueWatching()
             TVHomeDebugTrace.log("cw.approach loadNextPage end count=\(continueWatching.count)")
         }
+    }
+
+    /// Apply callback checkpoints without waiting for Trakt's next network
+    /// response, including when Home remained mounted behind Details.
+    private func refreshRemoteContinueWatchingImmediately() {
+        guard collectionHome == nil, usesRemoteProgress else { return }
+        let items = TraktProgressService.immediateContinueWatchingItems(
+            source: selectedProgressSource,
+            profileId: ContinueWatchingStore.activeProfileId
+        )
+        var seen = Set<String>()
+        setContinueWatching(items.filter {
+            shouldDisplayContinueWatchingItem($0)
+                && seen.insert($0.meta.id).inserted
+        })
+        displayedProgressSource = selectedProgressSource
     }
 
     private func scheduleContinueWatchingRefresh() {
