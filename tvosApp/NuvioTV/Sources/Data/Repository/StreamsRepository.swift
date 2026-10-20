@@ -294,6 +294,11 @@ final class StreamsRepository: ObservableObject {
             hasResolvedTargets: true
         )
 
+        // Fetch subtitle metadata concurrently with stream add-ons to avoid
+        // extending the loading spinner after streams finish.
+        async let pendingExternalSubtitles = fetchExternalSubtitles(
+            type: type, videoId: videoId, manifestURLs: enabledURLs)
+
         await withTaskGroup(of: GroupUpdate.self) { group in
             for target in targets {
                 group.addTask {
@@ -316,8 +321,7 @@ final class StreamsRepository: ObservableObject {
         // external subtitle decoration finishes. Stay "loading" through that step.
         publish(groups: state.groups, requestKey: requestKey, forceLoading: true)
 
-        let externalSubtitles = await fetchExternalSubtitles(
-            type: type, videoId: videoId, manifestURLs: enabledURLs)
+        let externalSubtitles = await pendingExternalSubtitles
         guard !Task.isCancelled, activeRequestKey == requestKey else { return }
 
         var finalGroups = state.groups
