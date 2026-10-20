@@ -105,11 +105,13 @@ final class KrystianReleaseMetadataRegressionTests: XCTestCase {
 
     func testBlurSettingIsProfileScopedAndDefaultsOff() {
         let key = SettingsKey.blurUnwatchedEpisodes
-        let a = UserDefaults(suiteName: "krystian-blur-a-\(UUID().uuidString)")!
-        let b = UserDefaults(suiteName: "krystian-blur-b-\(UUID().uuidString)")!
+        let suiteA = "krystian-blur-a-\(UUID().uuidString)"
+        let suiteB = "krystian-blur-b-\(UUID().uuidString)"
+        let a = UserDefaults(suiteName: suiteA)!
+        let b = UserDefaults(suiteName: suiteB)!
         defer {
-            a.removePersistentDomain(forName: a.volatileDomainNames.first(where: { $0.hasPrefix("krystian-blur-a") }) ?? "")
-            b.removePersistentDomain(forName: b.volatileDomainNames.first(where: { $0.hasPrefix("krystian-blur-b") }) ?? "")
+            a.removePersistentDomain(forName: suiteA)
+            b.removePersistentDomain(forName: suiteB)
         }
         XCTAssertFalse(a.bool(forKey: key))
         XCTAssertFalse(b.bool(forKey: key))
