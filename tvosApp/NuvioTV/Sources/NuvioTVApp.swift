@@ -4307,6 +4307,12 @@ private enum TVHomeProfileFocusTarget: Equatable {
     }
 }
 
+enum TVHomeTabRefreshPolicy {
+    static func needsInitialProgressFetch(initialFinished: Bool, sourceChanged: Bool) -> Bool {
+        !initialFinished || sourceChanged
+    }
+}
+
 struct TVHomeView: View {
     /// Failure sets a retry already ran against without improving them, keyed by
     /// the signature itself (which encodes the add-on set, so two profiles never
@@ -4863,7 +4869,10 @@ struct TVHomeView: View {
             refreshWatchedTitles()
             // A returning tab must not refetch progress just because it remounted.
             // First load / a changed progress source still needs initial data.
-            if !initialProgressRefreshFinished || displayedProgressSource != selectedProgressSource {
+            if TVHomeTabRefreshPolicy.needsInitialProgressFetch(
+                initialFinished: initialProgressRefreshFinished,
+                sourceChanged: displayedProgressSource != selectedProgressSource
+            ) {
                 scheduleContinueWatchingRefresh()
                 scheduleTraktWatchedHistorySync()
             }
@@ -4974,7 +4983,10 @@ struct TVHomeView: View {
                 // Keep existing rows and their scroll/focus state. Progress
                 // notifications, profile/provider changes and freshness policies
                 // perform real refreshes; tab visibility alone does not.
-                if !initialProgressRefreshFinished || displayedProgressSource != selectedProgressSource {
+                if TVHomeTabRefreshPolicy.needsInitialProgressFetch(
+                initialFinished: initialProgressRefreshFinished,
+                sourceChanged: displayedProgressSource != selectedProgressSource
+            ) {
                     scheduleContinueWatchingRefresh()
                 } else if !usesRemoteProgress {
                     refreshContinueWatching()
