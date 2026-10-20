@@ -7571,9 +7571,10 @@ private struct TvEpisodeCard: View {
         .frame(width: cardWidth, height: cardHeight)
         // Nuvio Mobile: 18.dp soft-focus on episode art only. The series
         // fallback image is not an episode spoiler and stays unblurred.
-        .blur(radius: blurUnwatchedEpisodes && !isWatched &&
-            video.thumbnail?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            ? 18 : 0, opaque: true)
+        .blur(radius: EpisodeSpoilerPolicy.shouldBlur(
+            enabled: blurUnwatchedEpisodes, isWatched: isWatched,
+            hasEpisodeArtwork: video.thumbnail?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        ) ? 18 : 0, opaque: true)
         .clipped()
     }
 
