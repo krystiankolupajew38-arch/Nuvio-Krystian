@@ -983,6 +983,105 @@ extension NuvioMeta {
 }
 
 enum EpisodeReleasePolicy {
+    enum Precision: String {
+        case exact
+        case localTime
+        case dateOnly
+        case invalid
+    }
+
+    /// Preserves the distinction between an instant and a calendar statement.
+    /// Never infer a US broadcast hour from a bare YYYY-MM-DD.
+    static func precision(of value: String?) -> Precision {
+        guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return .invalid }
+        if raw.count == 10 {
+            return validatedCalendarDay(raw) == nil ? .invalid : .dateOnly
+        }
+        guard raw.count >= 16, raw.count <= 40,
+              raw.range(of: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?$"#, options: .regularExpression) != nil,
+              validatedCalendarDay(String(raw.prefix(10))) != nil else {
+            return .invalid
+        }
+        let zoned = raw.hasSuffix("Z")
+            || raw.range(of: #"[+-]\d{2}:?\d{2}$"#, options: .regularExpression) != nil
+        if zoned {
+            return zonedTimestamp(raw) == nil ? .invalid : .exact
+        }
+        return localTimestamp(raw, timeZone: .current) == nil ? .invalid : .localTime
+    }
+
+    /// Original/add-on values win equally precise conflicts. Exact timestamps
+    /// beat date-only TMDB air_date, while a valid TMDB day can fill a gap.
+    static func preferredRelease(primary: String?, fallback: String?) -> String? {
+        let ranking: [Precision: Int] = [.invalid: 0, .dateOnly: 1, .localTime: 2, .exact: 3]
+        let preferredPrecision = precision(of: primary)
+        let fallbackPrecision = precision(of: fallback)
+        if (ranking[preferredPrecision] ?? 0) > 0,
+           (ranking[preferredPrecision] ?? 0) >= (ranking[fallbackPrecision] ?? 0) {
+            return primary
+        }
+        return (ranking[fallbackPrecision] ?? 0) > 0 ? fallback : nil
+    }
+
+    private static func validatedCalendarDay(_ day: String) -> String? {
+        guard day.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil,
+              let year = Int(day.prefix(4)),
+              let month = Int(day.dropFirst(5).prefix(2)),
+              let date = Int(day.suffix(2)) else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        guard let parsed = calendar.date(from: DateComponents(year: year, month: month, day: date)) else { return nil }
+        let parts = calendar.dateComponents([.year, .month, .day], from: parsed)
+        return parts.year == year && parts.month == month && parts.day == date ? day : nil
+    }
+
+    private static func zonedTimestamp(_ raw: String) -> Date? {
+        let normalized: String
+        if raw.range(of: #"[+-]\d{4}$"#, options: .regularExpression) != nil {
+            let before = raw.dropLast(5)
+            let offset = raw.suffix(5)
+            normalized = "\(before)\(offset.prefix(3)):\(offset.suffix(2))"
+        } else {
+            normalized = raw
+        }
+        // ISO8601DateFormatter expects seconds; some add-ons provide HH:mm.
+        let withSeconds = normalized.replacingOccurrences(
+            of: #"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(Z|[+-]\d{2}:\d{2})$"#,
+            with: "$1:00$2", options: .regularExpression
+        )
+        return fractionalISO8601Formatter.date(from: withSeconds)
+            ?? standardISO8601Formatter.date(from: withSeconds)
+    }
+
+    private static func localTimestamp(_ raw: String, timeZone: TimeZone) -> Date? {
+        let pattern = #"^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: raw, range: NSRange(raw.startIndex..., in: raw)),
+              match.range.length == (raw as NSString).length else { return nil }
+        func component(_ index: Int) -> Int? {
+            guard match.range(at: index).location != NSNotFound,
+                  let range = Range(match.range(at: index), in: raw) else { return nil }
+            return Int(raw[range])
+        }
+        guard let year = Int(raw.prefix(4)),
+              let month = Int(raw.dropFirst(5).prefix(2)),
+              let day = Int(raw.dropFirst(8).prefix(2)),
+              let hour = component(2), let minute = component(3),
+              hour < 24, minute < 60 else { return nil }
+        let second = component(4) ?? 0
+        guard second < 60 else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let parts = DateComponents(year: year, month: month, day: day, hour: hour, minute: minute, second: second)
+        guard let result = calendar.date(from: parts) else { return nil }
+        let verified = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: result)
+        guard verified.year == year, verified.month == month, verified.day == day,
+              verified.hour == hour, verified.minute == minute, verified.second == second else {
+            return nil
+        }
+        return result
+    }
     static let showUnairedNextUpKey = "nuvio.tv.settings.layout.showUnairedNextUp"
     static let upcomingNextSeasonWindowDays = 7
     /// The window during which an aired up-next episode is presented as new.
@@ -1023,8 +1122,7 @@ enum EpisodeReleasePolicy {
         // aired" once local time passes UTC midnight — 02:00 in UTC+2. Keep it
         // day-based so an episode airing today stays "today" all day, exactly
         // as `isAiringToday` compares calendar days.
-        let trimmed = released?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let day = isoDay(released), day == trimmed {
+        if precision(of: released) == .dateOnly, let day = localReleaseDay(released) {
             return day < todayIsoDay()
         }
         guard let releaseDate = releaseDate(for: released) else { return true }
@@ -1097,107 +1195,73 @@ enum EpisodeReleasePolicy {
         return isRecentlyReleased(released, within: newEpisodeWindowDays)
     }
 
-    /// Parses the exact release timestamp when one is supplied. Date-only
-    /// values fall back to midnight UTC, matching Android's
-    /// `parseReleaseDateToEpochMs` behavior.
-    static func releaseDate(for released: String?) -> Date? {
-        guard let raw = released?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty else { return nil }
-
+    /// All consumers use this parser. Zoned values are true instants, local
+    /// timestamps are interpreted in the device zone, and date-only metadata
+    /// remains a calendar statement (UTC midnight only as a sort key).
+    static func releaseDate(for released: String?, timeZone: TimeZone = .current) -> Date? {
+        guard let raw = released?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        // Unlike exact timestamps, timezone-less values are dependent on the
+        // device's current timezone and must not reuse another zone's cache.
+        let kind = precision(of: raw)
+        let cacheKey = kind == .localTime ? "\(timeZone.identifier)|\(raw)" : raw
         releaseDateCacheLock.lock()
         defer { releaseDateCacheLock.unlock() }
-        if let cached = releaseDateCache[raw] {
-            return cached.value
-        }
-
+        if let cached = releaseDateCache[cacheKey] { return cached.value }
         let parsed: Date?
-        if !raw.contains("T"), let day = isoDay(raw) {
-            let parts = day.split(separator: "-").compactMap { Int($0) }
-            if parts.count == 3 {
-                var calendar = Calendar(identifier: .gregorian)
-                calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
-                var components = DateComponents()
-                components.year = parts[0]
-                components.month = parts[1]
-                components.day = parts[2]
-                parsed = calendar.date(from: components)
-            } else {
-                parsed = nil
-            }
-        } else if let date = fractionalISO8601Formatter.date(from: raw) {
-            parsed = date
-        } else if let date = standardISO8601Formatter.date(from: raw) {
-            parsed = date
-        } else if let day = isoDay(raw) {
-            let parts = day.split(separator: "-").compactMap { Int($0) }
-            guard parts.count == 3 else {
-                cacheReleaseDate(nil, for: raw)
-                return nil
-            }
-
+        switch kind {
+        case .exact:
+            parsed = zonedTimestamp(raw)
+        case .localTime:
+            parsed = localTimestamp(raw, timeZone: timeZone)
+        case .dateOnly:
             var calendar = Calendar(identifier: .gregorian)
-            calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
-            var components = DateComponents()
-            components.year = parts[0]
-            components.month = parts[1]
-            components.day = parts[2]
-            parsed = calendar.date(from: components)
-        } else {
+            calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+            parsed = calendar.date(from: DateComponents(
+                year: Int(raw.prefix(4)), month: Int(raw.dropFirst(5).prefix(2)), day: Int(raw.suffix(2))
+            ))
+        case .invalid:
             parsed = nil
         }
-
-        cacheReleaseDate(parsed, for: raw)
+        cacheReleaseDate(parsed, for: cacheKey)
         return parsed
     }
 
-    private static func cacheReleaseDate(_ value: Date?, for raw: String) {
-        releaseDateCache[raw] = CachedReleaseDate(value: value)
-        releaseDateCacheOrder.append(raw)
+    private static func cacheReleaseDate(_ value: Date?, for key: String) {
+        releaseDateCache[key] = CachedReleaseDate(value: value)
+        releaseDateCacheOrder.append(key)
         if releaseDateCacheOrder.count > releaseDateCacheLimit {
             let evicted = releaseDateCacheOrder.removeFirst()
             releaseDateCache.removeValue(forKey: evicted)
         }
     }
 
-    /// Parses the calendar day portion at local midnight. This is used only for
-    /// the upcoming-season visibility window, which is date-based on Android.
     private static func calendarDayDate(for value: String?) -> Date? {
-        guard let day = isoDay(value) else { return nil }
-        let parts = day.split(separator: "-").compactMap { Int($0) }
-        guard parts.count == 3 else { return nil }
-        var components = DateComponents()
-        components.calendar = Calendar(identifier: .gregorian)
-        components.timeZone = TimeZone.current
-        components.year = parts[0]
-        components.month = parts[1]
-        components.day = parts[2]
-        return components.date
+        guard let day = localReleaseDay(value) else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        return calendar.date(from: DateComponents(
+            year: Int(day.prefix(4)), month: Int(day.dropFirst(5).prefix(2)), day: Int(day.suffix(2))
+        ))
     }
 
-    /// Date-only metadata is a provider calendar date; timestamped metadata
-    /// represents an instant and must use the Apple TV's current timezone.
+    /// Exact instants convert to the Apple TV's calendar day. Unknown-zone
+    /// timestamps and date-only values retain the provider's original day.
     static func localReleaseDay(_ value: String?, timeZone: TimeZone = .current) -> String? {
         guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines),
-              raw.count >= 10 else { return nil }
-        let day = String(raw.prefix(10))
-        let parts = day.split(separator: "-").compactMap { Int($0) }
-        guard parts.count == 3, day.count == 10 else { return nil }
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = timeZone
-        let dateOnly = DateComponents(year: parts[0], month: parts[1], day: parts[2])
-        guard let validatedDay = calendar.date(from: dateOnly),
-              calendar.dateComponents([.year, .month, .day], from: validatedDay).year == parts[0],
-              calendar.dateComponents([.year, .month, .day], from: validatedDay).month == parts[1],
-              calendar.dateComponents([.year, .month, .day], from: validatedDay).day == parts[2] else { return nil }
-        guard raw.count > 10, raw.dropFirst(10).first == "T" else { return day }
-        // Timezone-less ISO timestamps describe the provider's local date.
-        // Never interpret them as UTC just because a formatter does.
-        guard raw.hasSuffix("Z") || raw.range(of: #"[+-][0-9]{2}:?[0-9]{2}$"#, options: .regularExpression) != nil else { return day }
-        guard let instant = fractionalISO8601Formatter.date(from: raw)
-            ?? standardISO8601Formatter.date(from: raw) else { return nil }
-        let components = calendar.dateComponents([.year, .month, .day], from: instant)
-        guard let year = components.year, let month = components.month, let date = components.day else { return nil }
-        return String(format: "%04d-%02d-%02d", year, month, date)
+              let day = validatedCalendarDay(String(raw.prefix(10))) else { return nil }
+        switch precision(of: raw) {
+        case .dateOnly, .localTime:
+            return day
+        case .exact:
+            guard let instant = zonedTimestamp(raw) else { return nil }
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = timeZone
+            let parts = calendar.dateComponents([.year, .month, .day], from: instant)
+            guard let year = parts.year, let month = parts.month, let date = parts.day else { return nil }
+            return String(format: "%04d-%02d-%02d", year, month, date)
+        case .invalid:
+            return nil
+        }
     }
 
     private static func isoDay(_ value: String?) -> String? {
@@ -1870,7 +1934,7 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
     /// The episode guide travels with refreshed metadata. Prefer it over the
     /// stored enrichment override so an air-date correction is reflected without
     /// waiting for a progress record to be rebuilt.
-    private var effectiveEpisodeReleaseDate: String? { episodeVideo?.released ?? released }
+    var effectiveEpisodeReleaseDate: String? { EpisodeReleasePolicy.preferredRelease(primary: episodeVideo?.released, fallback: released) }
     var hasAired: Bool { EpisodeReleasePolicy.hasAired(effectiveEpisodeReleaseDate) }
     var isAiringToday: Bool { EpisodeReleasePolicy.isAiringToday(effectiveEpisodeReleaseDate) }
     var airDateText: String? { EpisodeReleasePolicy.airDateText(for: effectiveEpisodeReleaseDate) }
@@ -2880,7 +2944,7 @@ enum ContinueWatchingStore {
                         lastWatchedAt: entry.item.lastWatchedAt,
                         season: entry.item.season,
                         episode: entry.item.episode,
-                        released: latestEpisode?.released ?? entry.item.released,
+                        released: EpisodeReleasePolicy.preferredRelease(primary: latestEpisode?.released, fallback: entry.item.released),
                         episodeTitleOverride: entry.item.episodeTitleOverride,
                         episodeOverviewOverride: entry.item.episodeOverviewOverride,
                         episodeThumbnailOverride: entry.item.episodeThumbnailOverride,
