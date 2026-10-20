@@ -27,33 +27,6 @@ enum ContinueWatchingBuilder {
     static let initialResolutionLimit = 36
     private static let metadataConcurrency = 4
 
-    /// Opt-in diagnostics identify the precedence decision without serializing
-    /// private add-on URLs, account identifiers, episode artwork or stream links.
-    /// The repository independently logs the configured metadata provider index.
-    private static func diagnoseEpisodeDate(
-        season: Int?,
-        episode: Int?,
-        original: String?,
-        persisted: String? = nil,
-        tmdb: String?,
-        resolved: String?
-    ) {
-        guard ProfileSettings.current.bool(forKey: "nuvio.krystian.releaseDiagnostics") else { return }
-        let source: String
-        if original != nil && resolved == original {
-            source = "configured-metadata"
-        } else if persisted != nil && resolved == persisted {
-            source = "retained-progress"
-        } else if tmdb != nil && resolved == tmdb {
-            source = "tmdb-calendar-fallback"
-        } else {
-            source = "unknown"
-        }
-        let precision = EpisodeReleasePolicy.precision(of: resolved).rawValue
-        let day = EpisodeReleasePolicy.localReleaseDay(resolved) ?? "unknown"
-        print("[ReleaseDate] season=\(season ?? -1) episode=\(episode ?? -1) source=\(source) precision=\(precision) localDay=\(day) reason=most-precise-available-value")
-    }
-
     private static let lock = NSLock()
     private static var rebuildTask: Task<Void, Never>?
     private static var generation: UInt = 0
@@ -732,7 +705,8 @@ enum ContinueWatchingBuilder {
 
             if ProfileSettings.current.bool(forKey: SettingsKey.releaseDateDiagnostics) {
                 let original = spec.video?.released
-                let previous = spec.isSeed ? nil : existing?.released
+                let previous = spec.isSeed || existing?.season != record.season || existing?.episode != record.episode
+                    ? nil : existing?.released
                 let metadataChoice = EpisodeReleasePolicy.preferredRelease(
                     primary: original, fallback: previous
                 )
@@ -755,11 +729,6 @@ enum ContinueWatchingBuilder {
                     if let existing, existing.isUpNextEntry { page.append(existing) }
                     continue
                 }
-                diagnoseEpisodeDate(
-                    season: season, episode: ep, original: next.released,
-                    tmdb: tmdbEpisode?.released,
-                    resolved: EpisodeReleasePolicy.preferredRelease(primary: next.released, fallback: tmdbEpisode?.released)
-                )
                 page.append(
                     ContinueWatchingItem(
                         meta: meta,
@@ -786,11 +755,6 @@ enum ContinueWatchingBuilder {
                         fallback: sameEpisode ? existing?.released : nil
                     ),
                     fallback: tmdbEpisode?.released
-                )
-                diagnoseEpisodeDate(
-                    season: record.season, episode: record.episode, original: video?.released,
-                    persisted: sameEpisode ? existing?.released : nil,
-                    tmdb: tmdbEpisode?.released, resolved: selectedRelease
                 )
                 page.append(
                     ContinueWatchingItem(
