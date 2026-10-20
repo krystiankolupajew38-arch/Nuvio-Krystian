@@ -323,6 +323,9 @@ struct ContentView: View {
     @State private var activeScreen: TVScreen = .login
     @State private var playbackPartyID: UUID?
     @State private var playerSurfaceID = UUID()
+    /// One-shot percentage-only resume for the built-in player. Exact seconds
+    /// always take precedence. A new handoff clears this value.
+    @State private var playbackResumeFraction: Double?
     @State private var creatingParty = false
     @State private var choosingPartySource = false
     @State private var partyLaunchTask: Task<Void, Never>?
@@ -1313,6 +1316,7 @@ struct ContentView: View {
                 subtitle: item.episodeSubtitle ?? "",
                 externalSubtitles: [],
                 resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item),
+                resumeFraction: startFromBeginning ? nil : item.resumeProgressFraction,
                 httpHeaders: httpHeaders,
                 collectionContext: provenance
             )
@@ -1374,6 +1378,7 @@ struct ContentView: View {
                     subtitle: prepared.subtitleLine,
                     externalSubtitles: prepared.subtitles,
                     resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item),
+                resumeFraction: startFromBeginning ? nil : item.resumeProgressFraction,
                     httpHeaders: prepared.httpHeaders,
                     filename: prepared.filename,
                     videoSize: prepared.videoSize,
@@ -1489,6 +1494,7 @@ struct ContentView: View {
         subtitle: String,
         externalSubtitles: [NuvioSubtitle],
         resumeFrom: Double?,
+        resumeFraction: Double? = nil,
         httpHeaders: [String: String] = [:],
         origin: PlaybackOrigin = .main,
         customPlayer: ExternalPlayer? = nil,
@@ -1502,6 +1508,7 @@ struct ContentView: View {
         isActionPlaybackSession: Bool = false
     ) {
         playbackIsActionPlaybackSession = isActionPlaybackSession
+        playbackResumeFraction = resumeFrom == nil || resumeFrom == 0 ? resumeFraction : nil
         let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
         let isStandalonePlaybackSession = isTrailer || isActionPlaybackSession
         if !isStandalonePlaybackSession && (creatingParty || choosingPartySource) {
@@ -2943,6 +2950,7 @@ struct ContentView: View {
             httpHeaders: httpHeaders,
             externalSubtitles: externalSubtitles,
             resumeFrom: resumeFrom,
+            resumeFraction: playbackResumeFraction,
             isActionPlaybackSession: isActionPlaybackSession,
             playbackOrigin: playbackOrigin,
             filename: isStandalonePlaybackSession ? nil : playbackFilename,
