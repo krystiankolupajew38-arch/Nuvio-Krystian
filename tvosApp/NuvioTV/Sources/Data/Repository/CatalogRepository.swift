@@ -1122,7 +1122,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                 // The enabled manifest index identifies the provider without
                 // accidentally printing a credential-bearing manifest name/URL.
                 // Diagnostics are opt-in, derived from fetched results only.
-                if ProfileSettings.current.bool(forKey: "nuvio.krystian.releaseDiagnostics") {
+                if ProfileSettings.current.bool(forKey: SettingsKey.releaseDateDiagnostics) {
                     for video in (preferred.meta.videos ?? []) {
                         let kind = EpisodeReleasePolicy.precision(of: video.released).rawValue
                         let day = EpisodeReleasePolicy.localReleaseDay(video.released) ?? "unknown"
