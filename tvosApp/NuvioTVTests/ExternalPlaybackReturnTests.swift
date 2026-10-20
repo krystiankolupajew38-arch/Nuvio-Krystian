@@ -80,6 +80,75 @@ final class ExternalPlaybackReturnTests: XCTestCase {
     }
 
     @MainActor
+    func testInfuseCallbackStagePersistsAcrossReloadAndValidatesPlayedURL() {
+        let defaults = UserDefaults(suiteName: "infuse-stage-recovery-test")!
+        defer { defaults.removePersistentDomain(forName: "infuse-stage-recovery-test") }
+        var session = externalFixture()
+        session.externalPlayerName = ExternalPlayer.infuse.rawValue
+        ExternalPlaybackSessionStore.save(session, defaults: defaults)
+        let good = ExternalPlaybackCallback(
+            id: session.id, isError: false, progress: nil, position: 312,
+            lastPlayedURL: session.sourceURL
+        )
+        let bad = ExternalPlaybackCallback(
+            id: session.id, isError: false, progress: nil, position: 450,
+            lastPlayedURL: "https://example.invalid/different-episode"
+        )
+        XCTAssertFalse(ExternalPlaybackSessionStore.stage(bad, defaults: defaults))
+        XCTAssertTrue(ExternalPlaybackSessionStore.stage(good, defaults: defaults))
+        XCTAssertEqual(ExternalPlaybackSessionStore.load(defaults: defaults)?.returnedCallback, good)
+        XCTAssertFalse(ExternalPlaybackSessionStore.stage(bad, defaults: defaults))
+        var writes = 0
+        XCTAssertTrue(ExternalPlaybackReturnHandler.handle(
+            good, profileID: session.profileID, defaults: defaults
+        ) { captured, position, duration in
+            XCTAssertEqual(captured.episode, session.episode)
+            XCTAssertEqual(position, 312)
+            XCTAssertEqual(duration, 2_000)
+            writes += 1
+            return true
+        })
+        XCTAssertEqual(writes, 1)
+        XCTAssertNil(ExternalPlaybackSessionStore.load(defaults: defaults))
+    }
+
+    @MainActor
+    func testFailedInfusePersistencePreservesPendingPosition() {
+        let defaults = UserDefaults(suiteName: "infuse-stage-failure-test")!
+        defer { defaults.removePersistentDomain(forName: "infuse-stage-failure-test") }
+        var session = externalFixture()
+        session.externalPlayerName = ExternalPlayer.infuse.rawValue
+        ExternalPlaybackSessionStore.save(session, defaults: defaults)
+        let result = ExternalPlaybackCallback(
+            id: session.id, isError: false, progress: nil, position: 300,
+            lastPlayedURL: session.sourceURL
+        )
+        XCTAssertFalse(ExternalPlaybackReturnHandler.handle(
+            result, profileID: session.profileID, defaults: defaults
+        ) { _, _, _ in false })
+        XCTAssertEqual(ExternalPlaybackSessionStore.load(defaults: defaults)?.returnedCallback, result)
+        XCTAssertFalse(ExternalPlaybackReturnHandler.recover(profileID: "another-profile", defaults: defaults))
+        XCTAssertEqual(ExternalPlaybackSessionStore.load(defaults: defaults)?.returnedCallback, result)
+    }
+
+    func testUnverifiedEpisodeDurationNeverFabricatesCompletion() {
+        let original = externalFixture()
+        let unknown = ExternalPlaybackSession(
+            id: original.id, meta: original.meta, sourceURL: original.sourceURL,
+            season: original.season, episode: original.episode, duration: nil,
+            profileID: original.profileID
+        )
+        let callback = ExternalPlaybackCallback(id: original.id, isError: false, progress: nil, position: 310)
+        XCTAssertNil(unknown.sample(for: callback))
+        let underestimated = ExternalPlaybackSession(
+            id: original.id, meta: original.meta, sourceURL: original.sourceURL,
+            season: original.season, episode: original.episode, duration: 200,
+            profileID: original.profileID
+        )
+        XCTAssertNil(underestimated.sample(for: callback))
+    }
+
+    @MainActor
     func testExternalErrorRetiresSessionWithoutWritingProgress() {
         let suite = "external-return-error-test"
         let defaults = UserDefaults(suiteName: suite)!
