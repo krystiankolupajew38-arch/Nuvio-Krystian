@@ -730,6 +730,26 @@ enum ContinueWatchingBuilder {
             let existing = spec.existing
             let record = spec.entry.record
 
+            if ProfileSettings.current.bool(forKey: SettingsKey.releaseDateDiagnostics) {
+                let original = spec.video?.released
+                let previous = spec.isSeed ? nil : existing?.released
+                let metadataChoice = EpisodeReleasePolicy.preferredRelease(
+                    primary: original, fallback: previous
+                )
+                let chosen = EpisodeReleasePolicy.preferredRelease(
+                    primary: metadataChoice, fallback: tmdbEpisode?.released
+                )
+                let source = chosen == original && chosen != nil ? "configured-metadata"
+                    : chosen == previous && chosen != nil ? "previous-valid-release"
+                    : chosen == tmdbEpisode?.released && chosen != nil ? "TMDB-fallback"
+                    : "unknown"
+                let precision = EpisodeReleasePolicy.precision(of: chosen).rawValue
+                let originalPrecision = EpisodeReleasePolicy.precision(of: original).rawValue
+                let tmdbPrecision = EpisodeReleasePolicy.precision(of: tmdbEpisode?.released).rawValue
+                let localDay = EpisodeReleasePolicy.localReleaseDay(chosen) ?? "unknown"
+                print("[ReleaseSelection] season=\(spec.season ?? -1) episode=\(spec.episode ?? -1) source=\(source) precision=\(precision) localDay=\(localDay) originalPrecision=\(originalPrecision) tmdbPrecision=\(tmdbPrecision) reason=more-precise-first-then-provider-priority")
+            }
+
             if spec.isSeed {
                 guard let season = spec.season, let ep = spec.episode, let next = spec.video else {
                     if let existing, existing.isUpNextEntry { page.append(existing) }
