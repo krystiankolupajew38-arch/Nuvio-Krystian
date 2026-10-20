@@ -2120,7 +2120,10 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
     }
 
     var resumePosition: Double {
-        max(0, min(position, max(duration - 5, 0)))
+        // The phone preserves duration-less playback positions. A zero runtime
+        // must not turn an Infuse callback into a restart at the beginning.
+        guard duration > 0 else { return max(0, position) }
+        return max(0, min(position, max(duration - 5, 0)))
     }
 
     var remainingText: String {
@@ -2619,13 +2622,13 @@ enum ContinueWatchingStore {
         episodeId: String? = nil,
         requireVerifiedWrite: Bool = false
     ) -> Bool {
-        // A temporarily unavailable MPV time-pos must not erase a valid resume
-        // point. Only a coherent, started sample is allowed to replace/remove
-        // existing progress.
+        // Duration 0 is a valid "unknown" value for external players and
+        // synced phone progress. Keep absolute seconds without fabricating a
+        // percent or treating the sample as complete.
         guard position.isFinite,
               duration.isFinite,
               position > 0,
-              duration >= 60 else {
+              duration == 0 || duration >= 60 else {
             print("[ContinueWatching][Store] save rejected: meta=\(meta.id), pos=\(position), dur=\(duration)")
             return false
         }
