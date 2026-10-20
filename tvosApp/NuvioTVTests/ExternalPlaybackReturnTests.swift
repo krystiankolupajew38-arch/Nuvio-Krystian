@@ -22,7 +22,7 @@ final class ExternalPlaybackReturnTests: XCTestCase {
 
     func testExternalReturnRejectsMissingMalformedAndUntrackableData() {
         let session = externalFixture()
-        for query in ["", "position=NaN", "position=-1", "position=9", "position=3000", "progress=oops"] {
+        for query in ["", "position=NaN", "position=-1", "position=9", "progress=oops"] {
             let callback = ExternalPlaybackCallback.parse(URL(string: "nuvio-krystian://external-playback/return-test?\(query)")!)!
             XCTAssertNil(session.sample(for: callback), query)
         }
@@ -30,7 +30,9 @@ final class ExternalPlaybackReturnTests: XCTestCase {
         unknown = ExternalPlaybackSession(id: session.id, meta: session.meta, sourceURL: session.sourceURL,
                                           season: 1, episode: 3, duration: nil, profileID: session.profileID)
         XCTAssertNil(unknown.sample(for: ExternalPlaybackCallback(id: session.id, isError: false, progress: 1, position: nil)))
-        XCTAssertEqual(unknown.sample(for: ExternalPlaybackCallback(id: session.id, isError: false, progress: nil, position: 900, duration: 2000))?.position, 900)
+        XCTAssertEqual(unknown.sample(for: ExternalPlaybackCallback(id: session.id, isError: false, progress: nil, position: 900))?.position, 900)
+        XCTAssertEqual(unknown.sample(for: ExternalPlaybackCallback(id: session.id, isError: false, progress: nil, position: 900))?.duration, 0)
+        XCTAssertEqual(session.sample(for: ExternalPlaybackCallback(id: session.id, isError: false, progress: nil, position: 3000))?.duration, 0)
     }
 
     @MainActor
@@ -139,13 +141,42 @@ final class ExternalPlaybackReturnTests: XCTestCase {
             profileID: original.profileID
         )
         let callback = ExternalPlaybackCallback(id: original.id, isError: false, progress: nil, position: 310)
-        XCTAssertNil(unknown.sample(for: callback))
+        XCTAssertEqual(unknown.sample(for: callback)?.position, 310)
+        XCTAssertEqual(unknown.sample(for: callback)?.duration, 0)
         let underestimated = ExternalPlaybackSession(
             id: original.id, meta: original.meta, sourceURL: original.sourceURL,
             season: original.season, episode: original.episode, duration: 200,
             profileID: original.profileID
         )
-        XCTAssertNil(underestimated.sample(for: callback))
+        XCTAssertEqual(underestimated.sample(for: callback)?.position, 310)
+        XCTAssertEqual(underestimated.sample(for: callback)?.duration, 0)
+    }
+
+    @MainActor
+    func testUnknownDurationCallbackPersistsExactSecondsWithoutCompletion() {
+        let suite = "infuse-unknown-duration-test"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let source = externalFixture()
+        let session = ExternalPlaybackSession(
+            id: source.id, meta: source.meta, sourceURL: source.sourceURL,
+            season: source.season, episode: source.episode, duration: nil,
+            profileID: source.profileID, externalPlayerName: ExternalPlayer.infuse.rawValue
+        )
+        ExternalPlaybackSessionStore.save(session, defaults: defaults)
+        let result = ExternalPlaybackCallback(
+            id: session.id, isError: false, progress: nil,
+            position: 1_420, lastPlayedURL: session.sourceURL
+        )
+        XCTAssertTrue(ExternalPlaybackReturnHandler.handle(
+            result, profileID: session.profileID, defaults: defaults
+        ) { _, position, duration in
+            XCTAssertEqual(position, 1_420)
+            XCTAssertEqual(duration, 0)
+            XCTAssertFalse(duration > 0 && position / duration >= WatchProgressLedger.completionFraction)
+            return true
+        })
+        XCTAssertNil(ExternalPlaybackSessionStore.load(defaults: defaults))
     }
 
     @MainActor
