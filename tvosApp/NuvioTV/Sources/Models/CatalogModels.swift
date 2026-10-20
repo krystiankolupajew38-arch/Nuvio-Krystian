@@ -982,6 +982,18 @@ extension NuvioMeta {
     }
 }
 
+/// Pure presentation policy shared by Details and Home.
+enum EpisodeSpoilerPolicy {
+    static func shouldBlur(
+        enabled: Bool,
+        isWatched: Bool,
+        hasEpisodeArtwork: Bool,
+        displaysEpisodeArtwork: Bool = true
+    ) -> Bool {
+        enabled && !isWatched && hasEpisodeArtwork && displaysEpisodeArtwork
+    }
+}
+
 enum EpisodeReleasePolicy {
     enum Precision: String {
         case exact
