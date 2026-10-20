@@ -1004,7 +1004,7 @@ enum EpisodeReleasePolicy {
 
     /// Preserves the distinction between an instant and a calendar statement.
     /// Never infer a US broadcast hour from a bare YYYY-MM-DD.
-    static func precision(of value: String?) -> Precision {
+    static func precision(of value: String?, timeZone: TimeZone = .current) -> Precision {
         guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else { return .invalid }
         if raw.count == 10 {
@@ -1020,7 +1020,7 @@ enum EpisodeReleasePolicy {
         if zoned {
             return zonedTimestamp(raw) == nil ? .invalid : .exact
         }
-        return localTimestamp(raw, timeZone: .current) == nil ? .invalid : .localTime
+        return localTimestamp(raw, timeZone: timeZone) == nil ? .invalid : .localTime
     }
 
     /// Original/add-on values win equally precise conflicts. Exact timestamps
@@ -1048,7 +1048,11 @@ enum EpisodeReleasePolicy {
         return parts.year == year && parts.month == month && parts.day == date ? day : nil
     }
 
+    private static let timestampFormatterLock = NSLock()
+
     private static func zonedTimestamp(_ raw: String) -> Date? {
+        timestampFormatterLock.lock()
+        defer { timestampFormatterLock.unlock() }
         let normalized: String
         if raw.range(of: #"[+-]\d{4}$"#, options: .regularExpression) != nil {
             let before = raw.dropLast(5)
@@ -1214,7 +1218,7 @@ enum EpisodeReleasePolicy {
         guard let raw = released?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
         // Unlike exact timestamps, timezone-less values are dependent on the
         // device's current timezone and must not reuse another zone's cache.
-        let kind = precision(of: raw)
+        let kind = precision(of: raw, timeZone: timeZone)
         let cacheKey = kind == .localTime ? "\(timeZone.identifier)|\(raw)" : raw
         releaseDateCacheLock.lock()
         defer { releaseDateCacheLock.unlock() }
@@ -1261,7 +1265,7 @@ enum EpisodeReleasePolicy {
     static func localReleaseDay(_ value: String?, timeZone: TimeZone = .current) -> String? {
         guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines),
               let day = validatedCalendarDay(String(raw.prefix(10))) else { return nil }
-        switch precision(of: raw) {
+        switch precision(of: raw, timeZone: timeZone) {
         case .dateOnly, .localTime:
             return day
         case .exact:
