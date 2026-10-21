@@ -23,6 +23,7 @@ final class StreamsRepository: ObservableObject {
     @Published private(set) var state = StreamsDiscoveryState()
 
     private var activeJob: Task<Void, Never>?
+    private var subtitleJob: Task<Void, Never>?
     private var activeRequestKey: String?
     private var activeAddonManifestURLs: [URL]?
 
@@ -163,6 +164,7 @@ final class StreamsRepository: ObservableObject {
             hasResolvedTargets: false
         )
         activeJob?.cancel()
+        subtitleJob?.cancel()
         activeJob = Task { [weak self] in
             await self?.runDiscovery(
                 requestKey: key,
@@ -246,8 +248,22 @@ final class StreamsRepository: ObservableObject {
         // never hold the stream requests from already-ready add-ons.
         // The final stable group ID is still derived from manifest ID + URL,
         // preserving distinct Torrentio/AIO configurations.
-        async let pendingExternalSubtitles = fetchExternalSubtitles(
-            type: type, videoId: videoId, manifestURLs: enabledURLs)
+        // Subtitle work does not block stream discovery or the picker readiness
+        // state. Its result only enriches the current request's streams.
+        subtitleJob = Task { [weak self] in
+            guard let self else { return }
+            let subtitles = await self.fetchExternalSubtitles(
+                type: type, videoId: videoId, manifestURLs: enabledURLs
+            )
+            guard !Task.isCancelled, self.activeRequestKey == requestKey,
+                  !subtitles.isEmpty else { return }
+            let enriched = self.state.groups.map { group -> AddonStreamGroup in
+                var copy = group
+                copy.streams = group.streams.map { $0.mergingExternalSubtitles(subtitles) }
+                return copy
+            }
+            self.publish(groups: enriched, requestKey: requestKey, forceLoading: false)
+        }
 
         var compatibleTargets = 0
         await withTaskGroup(of: GroupUpdate?.self) { group in
@@ -300,19 +316,7 @@ final class StreamsRepository: ObservableObject {
 
         guard !Task.isCancelled, activeRequestKey == requestKey else { return }
 
-        // External subtitle discovery remains parallel; its completion must
-        // not delay the first usable stream results.
-        let externalSubtitles = await pendingExternalSubtitles
-        guard !Task.isCancelled, activeRequestKey == requestKey else { return }
-
-        var finalGroups = state.groups
-        if !externalSubtitles.isEmpty {
-            finalGroups = finalGroups.map { group in
-                var copy = group
-                copy.streams = group.streams.map { $0.mergingExternalSubtitles(externalSubtitles) }
-                return copy
-            }
-        }
+        let finalGroups = state.groups
         if compatibleTargets == 0, ownedGroups.isEmpty {
             state = StreamsDiscoveryState(
                 requestKey: requestKey,
@@ -326,7 +330,7 @@ final class StreamsRepository: ObservableObject {
             publish(groups: finalGroups, requestKey: requestKey, forceLoading: false)
         }
         print(
-            "[StreamsRepo] done key=\(requestKey) groups=\(finalGroups.count) streams=\(finalGroups.flatMap(\.streams).count) subtitles=\(externalSubtitles.count)"
+            "[StreamsRepo] done key=\(requestKey) groups=\(finalGroups.count) streams=\(finalGroups.flatMap(\.streams).count) subtitles=async"
         )
     }
 
