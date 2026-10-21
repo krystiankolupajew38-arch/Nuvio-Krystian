@@ -257,6 +257,13 @@ final class StreamsRepository: ObservableObject {
             )
             guard !Task.isCancelled, self.activeRequestKey == requestKey,
                   !subtitles.isEmpty else { return }
+            // Subtitle enrichment must not declare discovery finished while
+            // manifests or stream requests are still running.
+            while self.state.isAnyLoading && !Task.isCancelled {
+                guard self.activeRequestKey == requestKey else { return }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            guard !Task.isCancelled, self.activeRequestKey == requestKey else { return }
             let enriched = self.state.groups.map { group -> AddonStreamGroup in
                 var copy = group
                 copy.streams = group.streams.map { $0.mergingExternalSubtitles(subtitles) }
@@ -265,6 +272,9 @@ final class StreamsRepository: ObservableObject {
             self.publish(groups: enriched, requestKey: requestKey, forceLoading: false)
         }
 
+        let providerOrder = Dictionary(uniqueKeysWithValues:
+            enabledURLs.enumerated().map { ($0.element.absoluteString, $0.offset) }
+        )
         var compatibleTargets = 0
         await withTaskGroup(of: GroupUpdate?.self) { group in
             for url in enabledURLs {
@@ -297,18 +307,17 @@ final class StreamsRepository: ObservableObject {
                 } else {
                     groups.append(update.group)
                 }
-                let orderByURL = Dictionary(uniqueKeysWithValues:
-                    enabledURLs.enumerated().map { ($0.element.absoluteString, $0.offset) }
-                )
                 groups.sort { left, right in
-                    let leftURL = enabledURLs.first { url in
-                        left.addonId.hasSuffix(":" + url.absoluteString)
+                    // Retain the source order for multiple configured instances.
+                    // System/local sources precede remote add-ons.
+                    func order(_ group: AddonStreamGroup) -> Int {
+                        guard group.addonId.hasPrefix("addon:") else { return -1 }
+                        for url in enabledURLs where group.addonId.hasSuffix(":" + url.absoluteString) {
+                            return providerOrder[url.absoluteString] ?? Int.max
+                        }
+                        return Int.max
                     }
-                    let rightURL = enabledURLs.first { url in
-                        right.addonId.hasSuffix(":" + url.absoluteString)
-                    }
-                    return (leftURL.flatMap { orderByURL[$0.absoluteString] } ?? -1)
-                        < (rightURL.flatMap { orderByURL[$0.absoluteString] } ?? -1)
+                    return order(left) < order(right)
                 }
                 publish(groups: groups, requestKey: requestKey, forceLoading: true)
             }
