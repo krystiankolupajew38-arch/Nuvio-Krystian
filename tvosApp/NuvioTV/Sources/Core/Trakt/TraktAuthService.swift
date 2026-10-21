@@ -1310,17 +1310,10 @@ struct TraktProgressService {
         pruneExpiredLocalCheckpoints()
         let profileId = ContinueWatchingStore.activeProfileId
         let source = sourceOverride ?? TraktSettingsStore.watchProgressSource
-        if let local = localPlaybackCheckpoints.first(where: {
-            $0.profileId == profileId
-                && $0.source == source
-                && WatchedStore.sameContent($0.item.meta, meta)
-        })?.item {
-            return local
-        }
-        return continueWatchingSnapshots.first(where: {
-            $0.profileId == profileId && $0.source == source
-        })?
-            .items.first(where: { WatchedStore.sameContent($0.meta, meta) })
+        // Resolve the same reconciled representation Home draws. Looking up
+        // a raw checkpoint here used to drop a matching Trakt percentage.
+        return immediateContinueWatchingItems(source: source, profileId: profileId)
+            .first(where: { WatchedStore.sameContent($0.meta, meta) })
     }
 
     /// Publish the already-persisted local position synchronously on Home.
@@ -1808,8 +1801,17 @@ struct TraktProgressService {
                         )
                         confirmedItems.append(local)
                     } else {
-                        // Remote is the server-side confirmation of local playback.
-                        // Preserve exact local playback position and duration measured from the player.
+                        // The callback has exact seconds. Trakt normally has
+                        // only a fraction, not the episode runtime. Preserve
+                        // both signals without deriving fake seconds or blindly
+                        // adopting an old percentage from a previous playback.
+                        let candidatePercent = remote.explicitProgressPercent
+                        let percentageIsFromSameRecentPlayback =
+                            remote.lastWatchedAt >= local.lastWatchedAt.addingTimeInterval(-300)
+                            && remote.lastWatchedAt <= local.lastWatchedAt.addingTimeInterval(30)
+                        let displayPercent = local.duration <= 0
+                            && percentageIsFromSameRecentPlayback
+                            ? candidatePercent : nil
                         merged[index] = ContinueWatchingItem(
                             meta: remote.meta,
                             streamUrl: local.streamUrl.isEmpty ? remote.streamUrl : local.streamUrl,
@@ -1822,8 +1824,11 @@ struct TraktProgressService {
                             episodeTitleOverride: local.episodeTitleOverride ?? remote.episodeTitleOverride,
                             episodeOverviewOverride: local.episodeOverviewOverride ?? remote.episodeOverviewOverride,
                             episodeThumbnailOverride: local.episodeThumbnailOverride ?? remote.episodeThumbnailOverride,
-                            isUpNext: false
+                            isUpNext: false,
+                            explicitProgressPercent: displayPercent
                         )
+                        // The server percentage cannot confirm exact seconds;
+                        // do not delete that checkpoint on the first refresh.
                     }
                 } else {
                     let remoteIsNewer = remote.lastWatchedAt > local.lastWatchedAt.addingTimeInterval(1)
@@ -1844,6 +1849,8 @@ struct TraktProgressService {
                     && checkpoint.source == source
                     && confirmedItems.contains { confirmed in
                         WatchedStore.sameContent(checkpoint.item.meta, confirmed.meta)
+                            && checkpoint.item.season == confirmed.season
+                            && checkpoint.item.episode == confirmed.episode
                     }
             }
         }
