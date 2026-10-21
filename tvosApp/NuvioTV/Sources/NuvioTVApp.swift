@@ -4828,6 +4828,10 @@ struct TVHomeView: View {
             let clock = ContinuousClock()
             let started = clock.now
             while !Task.isCancelled {
+                // A real catalog card can be shown without waiting for
+                // unrelated Trakt/Nuvio Sync work. Remote progress continues
+                // independently; its existing reconciliation owns the row.
+                let hasUsableCatalog = profileGateStartupFocusTarget != nil
                 let progressReady = !continueWatchingVisible || (
                     initialProgressRefreshFinished
                     && NuvioSyncManager.current?.isHomePullPending != true
@@ -4836,7 +4840,7 @@ struct TVHomeView: View {
                 let elapsed = started.duration(to: clock.now).components
                 if gate.update(
                     elapsed: Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18,
-                    isReady: !isLoading && progressReady
+                    isReady: hasUsableCatalog || (!isLoading && progressReady)
                 ) {
                     refreshContinueWatching()
                     store.hasPresentedHome = true
@@ -5968,7 +5972,12 @@ struct TVHomeView: View {
     /// load. When returning from a card the sections are already cached in the
     /// store, so we render them straight away instead of flashing the spinner.
     private var showsLoading: Bool {
-        if collectionHome == nil { return !store.hasPresentedHome }
+        if collectionHome == nil {
+            // A usable catalog card is focusable as soon as the repository
+            // publishes it. Do not keep showing a spinner solely because
+            // remote Continue Watching has not finished refreshing.
+            return !store.hasPresentedHome && profileGateStartupFocusTarget == nil
+        }
         return isLoading
             && store.sections.isEmpty
             && continueWatching.isEmpty

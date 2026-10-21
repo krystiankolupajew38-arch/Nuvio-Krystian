@@ -2,6 +2,15 @@ import XCTest
 @testable import NuvioTV
 
 final class HomeStartupGateTests: XCTestCase {
+    func testCatalogReadinessCanReleaseBeforeRemoteProgressCompletes() {
+        var gate = TVHomeStartupGate()
+        XCTAssertFalse(gate.update(elapsed: 0.2, isReady: false))
+        // isReady comes from first focusable catalog OR fully settled progress.
+        XCTAssertFalse(gate.update(elapsed: 0.4, isReady: true))
+        XCTAssertTrue(gate.update(elapsed: 0.9, isReady: true))
+        XCTAssertTrue(gate.update(elapsed: 1.2, isReady: false))
+    }
+
     func testCatalogsArrivingBeforeProgressDoNotRevealHome() {
         var gate = TVHomeStartupGate()
         XCTAssertFalse(gate.update(elapsed: 1, isReady: false))
