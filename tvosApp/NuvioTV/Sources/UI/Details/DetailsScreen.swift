@@ -3274,11 +3274,20 @@ actor StreamPickerListWorker {
         }
         TVPickerHomeSignposts.mark("StreamListDerivationStarted")
         defer { TVPickerHomeSignposts.mark("StreamListDerivationFinished") }
+        // Only Quality needs every parsed fact. Preserve the lighter parsing
+        // paths for Name, Size and Default, avoiding a cold-cache regression.
+        if key.sortOption == .quality {
+            return StreamPickerListBuilder.displayedStreams(
+                streams: streams, groups: groups, selectedAddonId: key.selectedAddonId,
+                sortOption: key.sortOption, includeDebrid: key.includeDebrid,
+                cachedOnly: key.cachedOnly, preserveAddonStreams: key.preserveAddonStreams,
+                cachedFacts: { stream in self.facts(for: stream) }
+            )
+        }
         return StreamPickerListBuilder.displayedStreams(
             streams: streams, groups: groups, selectedAddonId: key.selectedAddonId,
             sortOption: key.sortOption, includeDebrid: key.includeDebrid,
-            cachedOnly: key.cachedOnly, preserveAddonStreams: key.preserveAddonStreams,
-            cachedFacts: { stream in self.facts(for: stream) }
+            cachedOnly: key.cachedOnly, preserveAddonStreams: key.preserveAddonStreams
         )
     }
 }
