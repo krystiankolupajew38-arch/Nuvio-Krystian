@@ -2973,7 +2973,8 @@ enum StreamPickerListBuilder {
         sortOption: StreamSortOption,
         includeDebrid: Bool,
         cachedOnly: Bool = false,
-        preserveAddonStreams: Bool = false
+        preserveAddonStreams: Bool = false,
+        cachedFacts: ((NuvioStream) -> SortFacts)? = nil
     ) -> [NuvioStream] {
         let playable = playableStreams(
             streams: streams,
@@ -2983,7 +2984,7 @@ enum StreamPickerListBuilder {
             cachedOnly: cachedOnly,
             preserveAddonStreams: preserveAddonStreams
         )
-        return sorted(playable, by: sortOption, preserveAddonStreams: preserveAddonStreams)
+        return sorted(playable, by: sortOption, preserveAddonStreams: preserveAddonStreams, cachedFacts: cachedFacts)
     }
 
     /// Constant-size cache key. Repository revision captures every publication,
@@ -3018,7 +3019,8 @@ enum StreamPickerListBuilder {
     static func sorted(
         _ streams: [NuvioStream],
         by option: StreamSortOption,
-        preserveAddonStreams: Bool = false
+        preserveAddonStreams: Bool = false,
+        cachedFacts: ((NuvioStream) -> SortFacts)? = nil
     ) -> [NuvioStream] {
         if preserveAddonStreams && option == .default {
             return streams
@@ -3028,7 +3030,7 @@ enum StreamPickerListBuilder {
         let actionItemIndices = streams.enumerated().filter { $0.element.isNotPlayable }
         if !actionItemIndices.isEmpty {
             let playableOnly = streams.filter { !$0.isNotPlayable }
-            let sortedPlayable = sortPlayableStreams(playableOnly, by: option, preserveAddonStreams: preserveAddonStreams)
+            let sortedPlayable = sortPlayableStreams(playableOnly, by: option, preserveAddonStreams: preserveAddonStreams, cachedFacts: cachedFacts)
             var result = sortedPlayable
             for item in actionItemIndices {
                 let insertIndex = min(item.offset, result.count)
@@ -3036,33 +3038,58 @@ enum StreamPickerListBuilder {
             }
             return result
         }
-        return sortPlayableStreams(streams, by: option, preserveAddonStreams: preserveAddonStreams)
+        return sortPlayableStreams(streams, by: option, preserveAddonStreams: preserveAddonStreams, cachedFacts: cachedFacts)
+    }
+
+    struct SortFacts {
+        let resolution: Int
+        let lowQuality: Bool
+        let quality: DebridStreamQuality
+        let size: Int64
+        let hardwareAccelerated: Bool
+
+        init(stream: NuvioStream) {
+            resolution = StreamPickerListBuilder.resolution(for: stream)
+            lowQuality = SmartPlaybackSelector.isLowQualityOrTicketStream(stream)
+            quality = StreamPickerListBuilder.streamQuality(for: stream)
+            size = StreamPickerListBuilder.sizeBytes(for: stream)
+            hardwareAccelerated = resolution >= 2160 && !AppleTVCapability.current.supportsAV1HardwareDecode
+                ? StreamQualityTags.parse(stream: stream).isHardwareAccelerated() : false
+        }
     }
 
     private static func sortPlayableStreams(
         _ streams: [NuvioStream],
         by option: StreamSortOption,
-        preserveAddonStreams: Bool = false
+        preserveAddonStreams: Bool = false,
+        cachedFacts: ((NuvioStream) -> SortFacts)? = nil
     ) -> [NuvioStream] {
         // Parse sort facts once per stream, not on every O(n log n) comparison.
         // Keep mode-specific work out of modes that do not use it.
         let needsResolution = !preserveAddonStreams || option == .quality || option == .default
         let needsHardwareCheck = option == .quality && !AppleTVCapability.current.supportsAV1HardwareDecode
-        let entries = streams.enumerated().map { entry in
-            let stream = entry.element
-            let resolutionValue = needsResolution ? resolution(for: stream) : 0
+        // Cancel superseded revisions before doing thousands of regex passes.
+        // The injected memo is owned by one background worker, never SwiftUI.
+        var entries: [(offset: Int, element: NuvioStream, resolution: Int,
+                       isBad: Bool, quality: DebridStreamQuality, size: Int64,
+                       hardwareAccelerated: Bool)] = []
+        entries.reserveCapacity(streams.count)
+        for (offset, stream) in streams.enumerated() {
+            if offset.isMultiple(of: 32) && Task<Never, Never>.isCancelled { return [] }
+            let facts = cachedFacts?(stream)
+            let resolutionValue = needsResolution ? (facts?.resolution ?? resolution(for: stream)) : 0
             let isBad = (!preserveAddonStreams || option == .default)
-                && (SmartPlaybackSelector.isLowQualityOrTicketStream(stream) || resolutionValue == 0)
-            return (
-                offset: entry.offset,
+                && ((facts?.lowQuality ?? SmartPlaybackSelector.isLowQualityOrTicketStream(stream)) || resolutionValue == 0)
+            entries.append((
+                offset: offset,
                 element: stream,
                 resolution: resolutionValue,
                 isBad: isBad,
-                quality: option == .quality ? streamQuality(for: stream) : DebridStreamQuality.unknown,
-                size: option == .quality || option == .size ? sizeBytes(for: stream) : 0,
+                quality: option == .quality ? (facts?.quality ?? streamQuality(for: stream)) : .unknown,
+                size: (option == .quality || option == .size) ? (facts?.size ?? sizeBytes(for: stream)) : 0,
                 hardwareAccelerated: needsHardwareCheck && resolutionValue >= 2160
-                    ? StreamQualityTags.parse(stream: stream).isHardwareAccelerated() : false
-            )
+                    ? (facts?.hardwareAccelerated ?? StreamQualityTags.parse(stream: stream).isHardwareAccelerated()) : false
+            ))
         }
 
         switch option {
@@ -3203,14 +3230,55 @@ struct StreamPickerListCacheKey: Equatable {
 actor StreamPickerListWorker {
     static let shared = StreamPickerListWorker()
 
-    func build(streams: [NuvioStream], groups: [AddonStreamGroup], key: StreamPickerListCacheKey) -> [NuvioStream] {
+    private struct Memo {
+        let fingerprint: Int
+        let facts: StreamPickerListBuilder.SortFacts
+    }
+    // FIFO bounded cache. All sort facts are reused across successive provider
+    // revisions and chip changes. Do not retain another profile's stream URLs.
+    private var factsByID: [String: Memo] = [:]
+    private var insertionOrder: [String] = []
+    private var cachedProfileID: String?
+    private let maximumFacts = 2_400
+
+    private func facts(for stream: NuvioStream) -> StreamPickerListBuilder.SortFacts {
+        var hasher = Hasher()
+        hasher.combine(stream.id)
+        hasher.combine(stream.name)
+        hasher.combine(stream.description)
+        hasher.combine(stream.filename)
+        hasher.combine(stream.videoSize)
+        hasher.combine(stream.isCached)
+        hasher.combine(stream.notPlayable)
+        let fingerprint = hasher.finalize()
+        if let entry = factsByID[stream.id], entry.fingerprint == fingerprint {
+            return entry.facts
+        }
+        let facts = StreamPickerListBuilder.SortFacts(stream: stream)
+        if factsByID[stream.id] == nil { insertionOrder.append(stream.id) }
+        factsByID[stream.id] = Memo(fingerprint: fingerprint, facts: facts)
+        if insertionOrder.count > maximumFacts {
+            let old = insertionOrder.removeFirst()
+            factsByID.removeValue(forKey: old)
+        }
+        return facts
+    }
+
+    func build(streams: [NuvioStream], groups: [AddonStreamGroup],
+               key: StreamPickerListCacheKey, profileID: String? = nil) -> [NuvioStream] {
         guard !Task.isCancelled else { return [] }
+        if cachedProfileID != profileID {
+            factsByID.removeAll(keepingCapacity: false)
+            insertionOrder.removeAll(keepingCapacity: false)
+            cachedProfileID = profileID
+        }
         TVPickerHomeSignposts.mark("StreamListDerivationStarted")
         defer { TVPickerHomeSignposts.mark("StreamListDerivationFinished") }
         return StreamPickerListBuilder.displayedStreams(
             streams: streams, groups: groups, selectedAddonId: key.selectedAddonId,
             sortOption: key.sortOption, includeDebrid: key.includeDebrid,
-            cachedOnly: key.cachedOnly, preserveAddonStreams: key.preserveAddonStreams
+            cachedOnly: key.cachedOnly, preserveAddonStreams: key.preserveAddonStreams,
+            cachedFacts: { stream in self.facts(for: stream) }
         )
     }
 }
@@ -8091,7 +8159,8 @@ private struct TvStreamPickerOverlay: View {
             refreshedStreams = cachedStreams
         } else {
             refreshedStreams = await StreamPickerListWorker.shared.build(
-                streams: streams, groups: groups, key: key
+                streams: streams, groups: groups, key: key,
+                profileID: pickerProfileID
             )
         }
         guard !Task.isCancelled, key == listCacheKey, pickerIsVisible else { return }

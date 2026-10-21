@@ -29,6 +29,53 @@ final class StreamsDiscoveryTests: XCTestCase {
     }
 
 
+    func testMemoisedPickerMatchesReferenceAtScaleAndAfterMetadataChange() async {
+        for count in [50, 500, 2_000] {
+            let initial = (0..<count).map {
+                NuvioStream(url: "https://example.invalid/stream/\($0).mp4",
+                            name: "\($0 % 2 == 0 ? "1080p WEB-DL" : "2160p REMUX")",
+                            description: "size \($0 % 7 + 1) GB", addonName: "A",
+                            videoSize: Int64($0 + 1))
+            }
+            for option in [StreamSortOption.quality, .size, .name, .default] {
+                let key = StreamPickerListBuilder.cacheKey(
+                    revision: UInt64(count), selectedAddonId: nil,
+                    sortOption: option, includeDebrid: false
+                )
+                let reference = StreamPickerListBuilder.displayedStreams(
+                    streams: initial, groups: [], selectedAddonId: nil,
+                    sortOption: option, includeDebrid: false
+                )
+                let first = await StreamPickerListWorker.shared.build(
+                    streams: initial, groups: [], key: key, profileID: "memo-test"
+                )
+                let second = await StreamPickerListWorker.shared.build(
+                    streams: initial, groups: [], key: key, profileID: "memo-test"
+                )
+                XCTAssertEqual(first.map(\.id), reference.map(\.id))
+                XCTAssertEqual(second.map(\.id), reference.map(\.id))
+            }
+            var changed = initial
+            changed[0] = NuvioStream(
+                url: "https://example.invalid/stream/0.mp4",
+                name: "480p CAM", description: "changed file size 2 MB",
+                addonName: "A", videoSize: 2
+            )
+            let key = StreamPickerListBuilder.cacheKey(
+                revision: UInt64(count + 1), selectedAddonId: nil,
+                sortOption: .quality, includeDebrid: false
+            )
+            let actual = await StreamPickerListWorker.shared.build(
+                streams: changed, groups: [], key: key, profileID: "memo-test"
+            )
+            let expected = StreamPickerListBuilder.displayedStreams(
+                streams: changed, groups: [], selectedAddonId: nil,
+                sortOption: .quality, includeDebrid: false
+            )
+            XCTAssertEqual(actual.map(\.id), expected.map(\.id))
+        }
+    }
+
     func testPaginationExpandsOnlyWhenFocusReachesCurrentPageEnd() {
         let streams = (0..<65).map { NuvioStream(url: "https://example.com/\($0).mp4", name: "Stream \($0)", description: nil, addonName: "Test") }
         for id in [nil, "filter::refresh", streams[0].id, streams[15].id, streams[40].id] {
