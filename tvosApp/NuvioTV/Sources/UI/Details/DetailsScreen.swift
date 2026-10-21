@@ -8003,9 +8003,12 @@ private struct TvStreamPickerOverlay: View {
                 }
                 guard newValue == nil else { return }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    if focusedItem == nil {
-                        seedInitialFocus()
-                    }
+                    // The delayed nil-focus recovery must not steal focus after
+                    // dismissal, profile change or another navigation event.
+                    guard pickerIsVisible,
+                          pickerProfileID == ProfileSettings.activeProfileID,
+                          focusedItem == nil else { return }
+                    seedInitialFocus()
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: StreamBadgeSettingsStore.changedNotification).receive(on: RunLoop.main)) { _ in
