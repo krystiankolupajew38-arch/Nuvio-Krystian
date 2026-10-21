@@ -8127,9 +8127,11 @@ private struct TvStreamPickerOverlay: View {
         // batches reduce whole-overlay SwiftUI invalidations while still giving
         // cancellation a chance between chunks when a new revision arrives.
         var stagedPresentations = streamCardPresentations
-        for startIndex in stride(from: 0, to: missingStreams.count, by: 16) {
+        // Fewer medium-sized worker batches reduce actor round-trips and
+        // SwiftUI updates when an add-on publishes hundreds of sources.
+        for startIndex in stride(from: 0, to: missingStreams.count, by: 32) {
             guard !Task.isCancelled else { return }
-            let endIndex = min(startIndex + 16, missingStreams.count)
+            let endIndex = min(startIndex + 32, missingStreams.count)
             let batch = Array(missingStreams[startIndex..<endIndex])
             let batchPresentations = await TvStreamCardPresentationBuilder.shared.build(
                 streams: batch,
@@ -8138,7 +8140,9 @@ private struct TvStreamPickerOverlay: View {
             guard !Task.isCancelled,
                   cacheKey == streamCardPresentationCacheKey else { return }
             stagedPresentations.merge(batchPresentations) { _, new in new }
-            if startIndex == 0 || endIndex % 64 == 0 || endIndex == missingStreams.count {
+            if startIndex == 0 || endIndex == missingStreams.count {
+                // Show the first page promptly, then publish the remainder in
+                // one UI update instead of invalidating the focus tree mid-list.
                 streamCardPresentations = stagedPresentations
             }
         }
