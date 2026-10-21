@@ -22,7 +22,9 @@ struct DebridStreamPresentation {
     /// playable. Pending torrents remain private until provider availability
     /// has been checked; the finalized result retains the existing fallback.
     static func immediatelyPlayable(_ streams: [NuvioStream]) -> [NuvioStream] {
-        streams.filter { !$0.isDebridResolvable }
+        streams.filter {
+            !$0.isDebridResolvable && !$0.isNotPlayable && $0.unavailabilityReason == nil
+        }
     }
 
     var activeProvider: DebridProviderKind {

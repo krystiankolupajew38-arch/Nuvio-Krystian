@@ -12,6 +12,20 @@ import XCTest
 private enum TestStreamError: Error { case failed }
 
 final class StreamsDiscoveryTests: XCTestCase {
+    func testUnavailableAndActionStreamsWaitForFinalProviderPresentation() {
+        let unavailable = NuvioStream(
+            url: "https://example.invalid/unavailable.mp4",
+            name: "Unavailable", description: nil, addonName: "Provider",
+            notPlayable: true
+        )
+        let direct = NuvioStream(
+            url: "https://example.invalid/direct.mp4",
+            name: "Direct", description: "1080p", addonName: "Provider"
+        )
+        let interim = DebridStreamPresentation.immediatelyPlayable([unavailable, direct])
+        XCTAssertEqual(interim.map(\.id), [direct.id])
+    }
+
     func testPendingTorrentIsNeverInInitialDirectPublication() {
         let direct = NuvioStream(
             url: "https://example.com/play.m3u8",
