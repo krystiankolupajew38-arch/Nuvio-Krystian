@@ -366,6 +366,29 @@ class BuildHelperTests(unittest.TestCase):
         self.assertNotIn('private-person', output.getvalue())
         self.assertEqual(json.loads(output.getvalue())['status'], 'FAIL')
 
+    def test_incremental_signature_failure_gets_one_clean_retry_and_all_checks(self):
+        b = self.builder()
+        b.build = mock.Mock()
+        b.verify = mock.Mock(side_effect=[kb.BuildError('Signature verification: failed (exit 1); private log retained.'), {}])
+        b.require_fresh_profiles = mock.Mock()
+        started = kb.dt.datetime.now(kb.dt.timezone.utc)
+        app = b.build_preparation_candidate(False, started)
+        self.assertEqual(b.build.call_args_list, [mock.call(clean=False, device=True), mock.call(clean=True, device=True)])
+        self.assertEqual(b.verify.call_count, 2)
+        b.require_fresh_profiles.assert_called_once_with(app, started)
+
+    def test_clean_retry_does_not_bypass_other_checks_or_loop(self):
+        for clean, message in [(False, 'Signing team mismatch.'),
+                               (True, 'Signature verification: failed (exit 1); private log retained.')]:
+            b = self.builder()
+            b.build = mock.Mock()
+            b.verify = mock.Mock(side_effect=kb.BuildError(message))
+            b.require_fresh_profiles = mock.Mock()
+            with self.assertRaises(kb.BuildError):
+                b.build_preparation_candidate(clean, kb.dt.datetime.now(kb.dt.timezone.utc))
+            self.assertEqual(b.build.call_count, 1)
+            b.require_fresh_profiles.assert_not_called()
+
     def provisioning_fixture(self):
         b = self.builder()
         b.config = mock.Mock(return_value={'team_id': 'TESTTEAM01', 'device_id': 'test-device'})

@@ -137,3 +137,23 @@ Ready for review, not deployed. Before any physical update, require explicit
 human GO and a successful fresh inventory/version check. After authorized
 installation, validate real Infuse return timing, exact resume, watched/Next Up,
 retained profiles/accounts, provider synchronization and Siri Remote focus.
+
+## Follow-up: fresh provisioning on every preparation
+
+The original profile expiry above is historical. At the user's request,
+`prepare` now always prompts Xcode for freshly issued app and Top Shelf profiles,
+with private recoverable backups scoped to this fork's exact team/bundle IDs.
+It requires fresh creation dates and at least six days remaining; old profiles
+cause failure. No certificates are revoked and no unrelated profiles are moved.
+
+The first incremental renewal build failed strict resource-seal verification and
+was rejected. A clean preparation succeeded and extended the earliest embedded
+expiry to **28 October 2026, 16:00:50 UTC**. The helper now automatically retries
+that specific incremental signature failure once with a clean build, retaining
+all verification gates. `verify` and `report` inspect without renewing.
+
+The helper regression suite now has **49 passing tests**, including profile scope,
+rollback, symlink rejection, both targets' freshness, mandatory renewal and bounded
+clean retry. Application code is unchanged; the 1,306-test evidence remains valid.
+This renews the prepared candidate only. The installed Apple TV app remains
+unchanged until explicit GO and successful deployment.

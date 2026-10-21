@@ -568,6 +568,22 @@ class Builder:
             self.save()
         return result
 
+    def build_preparation_candidate(self, clean, started):
+        built = self.root / 'derived-data/device/Build/Products/Debug-appletvos/NuvioTV.app'
+        self.build(clean=clean, device=True)
+        try:
+            self.verify(built)
+        except BuildError as error:
+            # Generated incremental output can retain stale resource seals.
+            # Retry only that signature failure, once, with a clean build.
+            # Never retry away identity, entitlement, expiry or checksum failures.
+            if clean or not str(error).startswith('Signature verification: failed (exit '):
+                raise
+            self.build(clean=True, device=True)
+            self.verify(built)
+        self.require_fresh_profiles(built, started)
+        return built
+
     def prepare(self, clean=False):
         self.config()
         require(self.source['branch'] == BRANCH, 'Preparation requires the development branch.')
@@ -577,10 +593,7 @@ class Builder:
         # Preparation always requests fresh profiles; build intermediates remain
         # reusable. Verification alone does not initiate account changes.
         with self.fresh_provisioning() as started:
-            self.build(clean=clean, device=True)
-            built = self.root / 'derived-data/device/Build/Products/Debug-appletvos/NuvioTV.app'
-            self.verify(built)
-            self.require_fresh_profiles(built, started)
+            built = self.build_preparation_candidate(clean, started)
         candidate = self.root / 'prepared' / ('candidate-' + uuid.uuid4().hex[:12])
         secure_dir(candidate / 'Payload')
         app = candidate / 'Payload/NuvioTV.app'

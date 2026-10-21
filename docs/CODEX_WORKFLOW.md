@@ -100,7 +100,11 @@ mappings are retained under `profile-backups`. This never changes the physical
 Apple TV; its installed app only benefits after a separately approved update.
 
 Use `verify` or `report` to inspect an existing candidate without requesting
-renewal. Application/test fingerprints still permit reusing test evidence and
+renewal. A strict signature failure on generated incremental output triggers one
+clean rebuild and full re-verification. Identity, entitlement and provisioning
+failures are not bypassed or retried by that fallback.
+
+Application/test fingerprints still permit reusing test evidence and
 compiled intermediates after helper/documentation changes.
 
 Prepared apps have a recursive SHA-256 covering relative paths, modes and file
