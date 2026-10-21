@@ -6065,6 +6065,9 @@ struct TVHomeView: View {
     private func acknowledgeNativeProfileCardFocus(_ cardKey: String) {
         guard isProfileFocusPending else { return }
         didNativeFocusGridHero = false
+        if nativeProfileFocusedCardKey == nil {
+            TVPickerHomeSignposts.mark("HomeNativeCardFocusAcknowledged")
+        }
         nativeProfileFocusedCardKey = cardKey
         TVHomeDebugTrace.log("home.profileGate.nativeCardFocus key=\(cardKey) target=\(profileGateStartupFocusTarget?.signature ?? "none")")
         reportProfileGateReadiness()
