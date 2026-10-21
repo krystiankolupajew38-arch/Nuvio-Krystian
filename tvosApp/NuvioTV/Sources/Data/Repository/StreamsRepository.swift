@@ -242,85 +242,66 @@ final class StreamsRepository: ObservableObject {
             return
         }
 
-        // Load missing manifests concurrently (app-lifetime cache).
-        let manifestsByURL = await Self.loadManifestsConcurrently(urls: enabledURLs)
-        guard !Task.isCancelled else { return }
-
-        // Preserve configured order; only include stream-capable, id-compatible add-ons.
-        var targets: [StreamAddonTarget] = []
-        for url in enabledURLs {
-            guard let manifest = manifestsByURL[url] else { continue }
-            guard manifest.supportsResource("stream", type: type, id: videoId) else { continue }
-            let displayName = manifest.displayName
-                ?? CinemetaCatalogRepository.streamAddonName(for: url)
-            targets.append(
-                StreamAddonTarget(
-                    addonId: Self.stableAddonId(manifest: manifest, manifestURL: url),
-                    displayName: displayName,
-                    manifestURL: url,
-                    logo: manifest.logo
-                )
-            )
-        }
-
-        guard !targets.isEmpty else {
-            state = StreamsDiscoveryState(
-                requestKey: requestKey,
-                revision: state.revision &+ 1,
-                groups: ownedGroups,
-                isAnyLoading: false,
-                emptyStateReason: ownedGroups.isEmpty ? .noCompatibleAddons : nil,
-                hasResolvedTargets: true
-            )
-            return
-        }
-
-        // Create every group as loading *before* any request so chips appear immediately.
-        let initialGroups = ownedGroups + targets.map {
-            AddonStreamGroup(
-                addonId: $0.addonId,
-                displayName: $0.displayName,
-                streams: [],
-                isLoading: true,
-                error: nil
-            )
-        }
-        state = StreamsDiscoveryState(
-            requestKey: requestKey,
-            revision: state.revision &+ 1,
-            groups: initialGroups,
-            isAnyLoading: true,
-            emptyStateReason: nil,
-            hasResolvedTargets: true
-        )
-
-        // Fetch subtitle metadata concurrently with stream add-ons to avoid
-        // extending the loading spinner after streams finish.
+        // Resolve and query every add-on independently: a stalled manifest must
+        // never hold the stream requests from already-ready add-ons.
+        // The final stable group ID is still derived from manifest ID + URL,
+        // preserving distinct Torrentio/AIO configurations.
         async let pendingExternalSubtitles = fetchExternalSubtitles(
             type: type, videoId: videoId, manifestURLs: enabledURLs)
 
-        await withTaskGroup(of: GroupUpdate.self) { group in
-            for target in targets {
+        var compatibleTargets = 0
+        await withTaskGroup(of: GroupUpdate?.self) { group in
+            for url in enabledURLs {
                 group.addTask {
-                    await Self.fetchAddonGroup(target: target, type: type, videoId: videoId)
+                    let manifest = await Self.loadManifest(url: url)
+                    guard !Task.isCancelled, let manifest,
+                          manifest.supportsResource("stream", type: type, id: videoId) else {
+                        return nil
+                    }
+                    let target = StreamAddonTarget(
+                        addonId: Self.stableAddonId(manifest: manifest, manifestURL: url),
+                        displayName: manifest.displayName
+                            ?? CinemetaCatalogRepository.streamAddonName(for: url),
+                        manifestURL: url,
+                        logo: manifest.logo
+                    )
+                    return await Self.fetchAddonGroup(target: target, type: type, videoId: videoId)
                 }
             }
 
             for await update in group {
-                guard !Task.isCancelled else { break }
-                guard self.activeRequestKey == requestKey else { break }
-                // Keep isAnyLoading true for the whole stream phase so the last
-                // group completing cannot drop observers before external subtitles.
-                apply(update: update, requestKey: requestKey, forceLoading: true)
+                guard !Task.isCancelled, activeRequestKey == requestKey else { break }
+                guard let update else { continue }
+                compatibleTargets += 1
+                var groups = state.groups
+                // Keep the user-configured provider order, regardless of which
+                // request finishes first, and retain provider-instance IDs.
+                if let existingIndex = groups.firstIndex(where: { $0.addonId == update.addonId }) {
+                    groups[existingIndex] = update.group
+                } else {
+                    groups.append(update.group)
+                }
+                let orderByURL = Dictionary(uniqueKeysWithValues:
+                    enabledURLs.enumerated().map { ($0.element.absoluteString, $0.offset) }
+                )
+                groups.sort { left, right in
+                    let leftURL = enabledURLs.first { url in
+                        left.addonId.hasSuffix(":" + url.absoluteString)
+                    }
+                    let rightURL = enabledURLs.first { url in
+                        right.addonId.hasSuffix(":" + url.absoluteString)
+                    }
+                    return (leftURL.flatMap { orderByURL[$0.absoluteString] } ?? -1)
+                        < (rightURL.flatMap { orderByURL[$0.absoluteString] } ?? -1)
+                }
+                publish(groups: groups, requestKey: requestKey, forceLoading: true)
             }
         }
 
         guard !Task.isCancelled, activeRequestKey == requestKey else { return }
 
-        // Stream groups are done, but smart subtitle matching must not run until
-        // external subtitle decoration finishes. Stay "loading" through that step.
-        publish(groups: state.groups, requestKey: requestKey, forceLoading: true)
-
+        // External subtitle discovery remains parallel; its completion must
+        // not delay the first usable stream results.
         let externalSubtitles = await pendingExternalSubtitles
         guard !Task.isCancelled, activeRequestKey == requestKey else { return }
 
@@ -332,10 +313,29 @@ final class StreamsRepository: ObservableObject {
                 return copy
             }
         }
-        publish(groups: finalGroups, requestKey: requestKey, forceLoading: false)
+        if compatibleTargets == 0, ownedGroups.isEmpty {
+            state = StreamsDiscoveryState(
+                requestKey: requestKey,
+                revision: state.revision &+ 1,
+                groups: finalGroups,
+                isAnyLoading: false,
+                emptyStateReason: .noCompatibleAddons,
+                hasResolvedTargets: true
+            )
+        } else {
+            publish(groups: finalGroups, requestKey: requestKey, forceLoading: false)
+        }
         print(
-            "[StreamsRepo] done key=\(requestKey) groups=\(finalGroups.count) streams=\(finalGroups.flatMap(\.streams).count) empty=\(String(describing: state.emptyStateReason)) subtitles=\(externalSubtitles.count)"
+            "[StreamsRepo] done key=\(requestKey) groups=\(finalGroups.count) streams=\(finalGroups.flatMap(\\.streams).count) subtitles=\(externalSubtitles.count)"
         )
+    }
+
+    /// Single-target manifest lookup so ready add-ons do not wait for others.
+    private static func loadManifest(url: URL) async -> StreamAddonManifest? {
+        if let cached = await manifestCache.success(for: url) { return cached }
+        guard let fetched = await fetchManifest(url) else { return nil }
+        await manifestCache.storeSuccess(fetched, for: url)
+        return fetched
     }
 
     private func apply(update: GroupUpdate, requestKey: String, forceLoading: Bool) {
