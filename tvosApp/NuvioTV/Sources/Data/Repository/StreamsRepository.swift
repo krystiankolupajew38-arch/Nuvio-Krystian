@@ -154,6 +154,7 @@ final class StreamsRepository: ObservableObject {
             return
         }
 
+        TVPickerHomeSignposts.mark("StreamDiscoveryRequested")
         activeRequestKey = key
         activeAddonManifestURLs = addonManifestURLs
         state = StreamsDiscoveryState(
@@ -220,6 +221,7 @@ final class StreamsRepository: ObservableObject {
 
     private func runDiscovery(requestKey: String, type: String, videoId: String,
                               addonManifestURLs: [URL]) async {
+        TVPickerHomeSignposts.mark("StreamDiscoveryStarted")
         guard !Task.isCancelled else { return }
         let ownedGroups = [localStreamGroup(videoId: videoId), jellyfinStreamGroup(videoId: videoId)]
             .compactMap { $0 }
@@ -345,7 +347,10 @@ final class StreamsRepository: ObservableObject {
 
     /// Single-target manifest lookup so ready add-ons do not wait for others.
     private static func loadManifest(url: URL) async -> StreamAddonManifest? {
-        await manifestCache.load(url: url) { await fetchManifest(url) }
+        TVPickerHomeSignposts.mark("StreamManifestLookupStarted")
+        let result = await manifestCache.load(url: url) { await fetchManifest(url) }
+        TVPickerHomeSignposts.mark("StreamManifestLookupFinished")
+        return result
     }
 
     private func apply(update: GroupUpdate, requestKey: String, forceLoading: Bool) {
@@ -364,6 +369,7 @@ final class StreamsRepository: ObservableObject {
             if groups.isEmpty { return .noCompatibleAddons }
             return .noStreamsFound
         }()
+        TVPickerHomeSignposts.mark("StreamRepositoryPublished")
         state = StreamsDiscoveryState(
             requestKey: requestKey,
             revision: state.revision &+ 1,
@@ -429,14 +435,18 @@ final class StreamsRepository: ObservableObject {
             var streams: [NuvioStream] = []
             while true {
                 do {
+                    TVPickerHomeSignposts.mark("StreamProviderRequestStarted")
                     streams = try await fetchStreams(from: streamURL, addonName: target.displayName, logo: target.logo)
+                    TVPickerHomeSignposts.mark("StreamProviderDecoded")
                     break
                 } catch {
                     guard attempt == 0, StreamRequestRetryPolicy.shouldRetry(error) else { throw error }
                     attempt += 1
                 }
             }
+            TVPickerHomeSignposts.mark("DebridPresentationStarted")
             let presentedStreams = await DebridStreamPresentation.present(streams: streams)
+            TVPickerHomeSignposts.mark("DebridPresentationFinished")
             return GroupUpdate(
                 addonId: target.addonId,
                 group: AddonStreamGroup(
@@ -487,7 +497,10 @@ final class StreamsRepository: ObservableObject {
             throw URLError(.badServerResponse)
         }
         try Task.checkCancellation()
+        TVPickerHomeSignposts.mark("StreamHTTPResponseReceived")
+        TVPickerHomeSignposts.mark("StreamDecodingStarted")
         let decoded = try JSONDecoder().decode(StreamAddonResponse.self, from: data)
+        TVPickerHomeSignposts.mark("StreamDecodingFinished")
         return (decoded.streams ?? []).compactMap { raw in
             guard let stream = raw.toNuvioStream(addonName: addonName) else { return nil }
             return logo.map { stream.withAddonLogoURL($0) } ?? stream

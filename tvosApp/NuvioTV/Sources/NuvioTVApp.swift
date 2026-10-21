@@ -225,6 +225,23 @@ enum TVHomeDebugTrace {
     }
 }
 
+/**
+ Instruments Points of Interest events for the stream picker and Home startup.
+ Event names are fixed: never emit content IDs, source URLs, tokens or profile IDs.
+ These markers intentionally do not claim a visual frame or focus was accepted
+ by the physical focus engine; compare their timestamps with device recordings.
+ */
+enum TVPickerHomeSignposts {
+    private static let signposter = OSSignposter(
+        subsystem: "com.krystian.nuvio",
+        category: "HomeStreamPerformance"
+    )
+
+    static func mark(_ stage: StaticString) {
+        signposter.emitEvent(stage)
+    }
+}
+
 enum TVScreen: Equatable, CustomStringConvertible {
     case login
     case profileSelection
@@ -1113,6 +1130,7 @@ struct ContentView: View {
     /// Empty or failed loads get a bounded escape. Populated content waits for
     /// Home's native focus acknowledgement, even after the deadline.
     private func beginProfileGate() {
+        TVPickerHomeSignposts.mark("ProfileGateStarted")
         profileGateTask?.cancel()
         profileGateLiftTask?.cancel()
         profileGateGeneration &+= 1
@@ -1198,6 +1216,7 @@ struct ContentView: View {
         profileGateLiftTask = nil
         profileGateStartedAt = nil
         guard isPreparingProfile else { return }
+        TVPickerHomeSignposts.mark("ProfileGateReleased")
         withAnimation(.easeInOut(duration: 0.22)) {
             isPreparingProfile = false
         }
@@ -4804,6 +4823,7 @@ struct TVHomeView: View {
         }
         .task(id: "\(contentIdentity.profileId):\(store.hasPresentedHome)") {
             guard collectionHome == nil, !store.hasPresentedHome else { return }
+            TVPickerHomeSignposts.mark("HomeReadinessGateStarted")
             var gate = TVHomeStartupGate()
             let clock = ContinuousClock()
             let started = clock.now
@@ -4820,6 +4840,7 @@ struct TVHomeView: View {
                 ) {
                     refreshContinueWatching()
                     store.hasPresentedHome = true
+                    TVPickerHomeSignposts.mark("HomeReadinessGateReleased")
                     return
                 }
                 do { try await Task.sleep(for: .milliseconds(100)) }
@@ -4845,6 +4866,7 @@ struct TVHomeView: View {
         }
         .onAppear {
             TVHomeDebugTrace.startWatchdogIfNeeded()
+            TVPickerHomeSignposts.mark("HomeViewAppeared")
             reportProfileGateReadiness()
             // A TabView may recreate Home instead of keeping it mounted. Arm
             // before its saved focus is restored so the first layout pass is

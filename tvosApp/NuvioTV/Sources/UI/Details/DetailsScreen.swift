@@ -3205,6 +3205,8 @@ actor StreamPickerListWorker {
 
     func build(streams: [NuvioStream], groups: [AddonStreamGroup], key: StreamPickerListCacheKey) -> [NuvioStream] {
         guard !Task.isCancelled else { return [] }
+        TVPickerHomeSignposts.mark("StreamListDerivationStarted")
+        defer { TVPickerHomeSignposts.mark("StreamListDerivationFinished") }
         return StreamPickerListBuilder.displayedStreams(
             streams: streams, groups: groups, selectedAddonId: key.selectedAddonId,
             sortOption: key.sortOption, includeDebrid: key.includeDebrid,
@@ -7960,6 +7962,7 @@ private struct TvStreamPickerOverlay: View {
             // first card once results exist.
             .onAppear {
                 pickerIsVisible = true
+                TVPickerHomeSignposts.mark("StreamPickerAppeared")
                 pickerProfileID = ProfileSettings.activeProfileID
                 seedInitialFocus()
                 if !didPresentInitialAvailabilityMessage {
@@ -7995,6 +7998,7 @@ private struct TvStreamPickerOverlay: View {
                     newValue, streams: displayedStreams, currentLimit: visibleStreamLimit
                 )
                 if let newValue, newValue != filterAllKey, !didSeedStreamFocus {
+                    TVPickerHomeSignposts.mark("StreamPickerFirstFocusCandidate")
                     didSeedStreamFocus = true
                 }
                 guard newValue == nil else { return }
@@ -8063,6 +8067,7 @@ private struct TvStreamPickerOverlay: View {
 
     private func select(_ stream: NuvioStream, player: ExternalPlayer?) {
         guard let reason = stream.unavailabilityReason else {
+            TVPickerHomeSignposts.mark("StreamPickerSelectionAccepted")
             onSelect(stream, player)
             return
         }
@@ -8102,6 +8107,9 @@ private struct TvStreamPickerOverlay: View {
                 && previous.cachedOnly == key.cachedOnly
                 && previous.preserveAddonStreams == key.preserveAddonStreams
         } ?? false
+        if displayedStreamsCacheKey == nil && !refreshedStreams.isEmpty {
+            TVPickerHomeSignposts.mark("StreamPickerFirstPageReady")
+        }
         displayedStreams = refreshedStreams
         displayedStreamsCacheKey = key
         let focusedIndex = focusedItem.flatMap { id in refreshedStreams.firstIndex { $0.id == id } }
