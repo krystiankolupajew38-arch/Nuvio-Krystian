@@ -12,6 +12,22 @@ import XCTest
 private enum TestStreamError: Error { case failed }
 
 final class StreamsDiscoveryTests: XCTestCase {
+    func testPendingTorrentIsNeverInInitialDirectPublication() {
+        let direct = NuvioStream(
+            url: "https://example.com/play.m3u8",
+            name: "Direct", description: "1080p", addonName: "Provider"
+        )
+        let torrent = NuvioStream(
+            url: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            name: "Torrent", description: "1080p", addonName: "Provider",
+            infoHash: "0123456789abcdef0123456789abcdef01234567"
+        )
+        XCTAssertFalse(direct.isDebridResolvable)
+        XCTAssertTrue(torrent.isDebridResolvable)
+        let interim = DebridStreamPresentation.immediatelyPlayable([torrent, direct])
+        XCTAssertEqual(interim.map(\.id), [direct.id])
+    }
+
 
     func testPaginationExpandsOnlyWhenFocusReachesCurrentPageEnd() {
         let streams = (0..<65).map { NuvioStream(url: "https://example.com/\($0).mp4", name: "Stream \($0)", description: nil, addonName: "Test") }

@@ -293,7 +293,12 @@ final class StreamsRepository: ObservableObject {
                         manifestURL: url,
                         logo: manifest.logo
                     )
-                    return await Self.fetchAddonGroup(target: target, type: type, videoId: videoId)
+                    return await Self.fetchAddonGroup(
+                        target: target, type: type, videoId: videoId,
+                        publishDirect: { [weak self] early in
+                            await self?.publishEarly(early, requestKey: requestKey, enabledURLs: enabledURLs)
+                        }
+                    )
                 }
             }
 
@@ -353,6 +358,33 @@ final class StreamsRepository: ObservableObject {
         return result
     }
 
+    /// An early group publication is not a completed provider. The final
+    /// task-group result replaces it, and only final results count as complete.
+    private func publishEarly(
+        _ update: GroupUpdate, requestKey: String, enabledURLs: [URL]
+    ) {
+        guard activeRequestKey == requestKey, state.requestKey == requestKey else { return }
+        var groups = state.groups
+        if let index = groups.firstIndex(where: { $0.addonId == update.addonId }) {
+            // Do not replace an already completed result with a late early result.
+            guard groups[index].isLoading else { return }
+            groups[index] = update.group
+        } else {
+            groups.append(update.group)
+        }
+        // Same stable instance order as the terminal provider update.
+        groups.sort { left, right in
+            func order(_ item: AddonStreamGroup) -> Int {
+                guard item.addonId.hasPrefix("addon:") else { return -1 }
+                return enabledURLs.firstIndex(where: {
+                    item.addonId.hasSuffix(":" + $0.absoluteString)
+                }) ?? Int.max
+            }
+            return order(left) < order(right)
+        }
+        publish(groups: groups, requestKey: requestKey, forceLoading: true)
+    }
+
     private func apply(update: GroupUpdate, requestKey: String, forceLoading: Bool) {
         var groups = state.groups
         guard let index = groups.firstIndex(where: { $0.addonId == update.addonId }) else { return }
@@ -410,7 +442,8 @@ final class StreamsRepository: ObservableObject {
     private static func fetchAddonGroup(
         target: StreamAddonTarget,
         type: String,
-        videoId: String
+        videoId: String,
+        publishDirect: @escaping @Sendable (GroupUpdate) async -> Void
     ) async -> GroupUpdate {
         guard let streamURL = AddonTransportUrls.buildResourceURL(
             manifestURL: target.manifestURL,
@@ -442,6 +475,24 @@ final class StreamsRepository: ObservableObject {
                 } catch {
                     guard attempt == 0, StreamRequestRetryPolicy.shouldRetry(error) else { throw error }
                     attempt += 1
+                }
+            }
+            // Release already playable direct URLs before waiting for unrelated
+            // debrid cache lookups. Do not expose any unchecked torrent.
+            if DebridStreamPresentation().isDebridEnabled {
+                let direct = DebridStreamPresentation.immediatelyPlayable(streams)
+                if !direct.isEmpty && direct.count != streams.count && !Task.isCancelled {
+                    await publishDirect(GroupUpdate(
+                        addonId: target.addonId,
+                        group: AddonStreamGroup(
+                            addonId: target.addonId,
+                            displayName: target.displayName,
+                            streams: direct,
+                            isLoading: true,
+                            error: nil
+                        )
+                    ))
+                    TVPickerHomeSignposts.mark("StreamDirectResultsPublished")
                 }
             }
             TVPickerHomeSignposts.mark("DebridPresentationStarted")
