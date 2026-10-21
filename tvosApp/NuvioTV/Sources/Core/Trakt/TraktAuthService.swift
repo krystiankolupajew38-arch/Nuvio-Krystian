@@ -1621,7 +1621,12 @@ struct TraktProgressService {
         var seeds =
             movies.orEmpty.compactMap { playbackSeed(from: $0, type: "movie") }
             + episodes.orEmpty.compactMap { playbackSeed(from: $0, type: "series") }
-        let playbackIDs = Set(seeds.map(\.contentID))
+        // Match each paused episode against later watched history before
+        // suppressing Next Up for the entire series.
+        var pausedByContentID = Dictionary(
+            seeds.map { ($0.contentID, $0) },
+            uniquingKeysWith: { left, right in left.lastUpdated >= right.lastUpdated ? left : right }
+        )
         let preferFurthestEpisode = UpNextEpisodeSelectionPolicy.prefersFurthestEpisode
 
         // Merge both watched-show progress and episode history. The former is
@@ -1632,13 +1637,19 @@ struct TraktProgressService {
         for seed in watchedShows.orEmpty.compactMap({
             nextUpSeed(from: $0, preferFurthestEpisode: preferFurthestEpisode)
         }) {
-            guard !playbackIDs.contains(seed.contentID) else { continue }
+            if let paused = pausedByContentID[seed.contentID] {
+                guard completedSeedSupersedesPlayback(seed, playback: paused) else { continue }
+                pausedByContentID.removeValue(forKey: seed.contentID)
+                seeds.removeAll { $0.contentID == seed.contentID }
+            }
             upNextSeedsByContentID[seed.contentID] = seed
         }
         for history in episodeHistory.orEmpty {
-            guard let candidate = nextUpSeed(from: history),
-                  !playbackIDs.contains(candidate.contentID) else {
-                continue
+            guard let candidate = nextUpSeed(from: history) else { continue }
+            if let paused = pausedByContentID[candidate.contentID] {
+                guard completedSeedSupersedesPlayback(candidate, playback: paused) else { continue }
+                pausedByContentID.removeValue(forKey: candidate.contentID)
+                seeds.removeAll { $0.contentID == candidate.contentID }
             }
             if let current = upNextSeedsByContentID[candidate.contentID] {
                 guard UpNextEpisodeSelectionPolicy.prefers(
@@ -2114,6 +2125,18 @@ struct TraktProgressService {
                 sourceOverride: source
             )
         }
+    }
+
+    /// A later watched event for the same episode beats an older pause.
+    /// Preserve newer pauses to allow intentional replays and rewinds.
+    private static func completedSeedSupersedesPlayback(
+        _ completed: TraktProgressSeed,
+        playback: TraktProgressSeed
+    ) -> Bool {
+        guard completed.isUpNext, !playback.isUpNext,
+              completed.season == playback.season,
+              completed.episode == playback.episode else { return false }
+        return completed.lastUpdated >= playback.lastUpdated
     }
 
     private static func playbackSeed(from item: TraktPlaybackDTO, type: String) -> TraktProgressSeed? {
