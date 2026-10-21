@@ -326,7 +326,7 @@ final class StreamsRepository: ObservableObject {
             publish(groups: finalGroups, requestKey: requestKey, forceLoading: false)
         }
         print(
-            "[StreamsRepo] done key=\(requestKey) groups=\(finalGroups.count) streams=\(finalGroups.flatMap(\\.streams).count) subtitles=\(externalSubtitles.count)"
+            "[StreamsRepo] done key=\(requestKey) groups=\(finalGroups.count) streams=\(finalGroups.flatMap(\.streams).count) subtitles=\(externalSubtitles.count)"
         )
     }
 
