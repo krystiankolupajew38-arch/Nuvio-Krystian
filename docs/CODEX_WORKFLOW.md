@@ -1,5 +1,9 @@
 # Nuvio-K local build workflow
 
+Current preparation branch: `fix/infuse-progress-ui-stream-picker-performance`.
+The helper rejects other branches for preparation; deployment still requires a
+separate explicit human GO.
+
 Begin a session with:
 
 ```sh

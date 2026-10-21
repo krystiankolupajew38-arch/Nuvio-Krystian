@@ -1,5 +1,9 @@
 # Infuse episode progress returns
 
+For the current review and corrections, see
+[21 October release review](docs/krystian-validation-2026-10-21.md).
+The following sections record earlier implementation stages.
+
 Branch: `fix/infuse-episode-progress-sync`, based on `fix/home-startup-loading`.
 
 ## Diagnosis

@@ -19,7 +19,7 @@ import time
 import uuid
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
-BRANCH = 'fix/infuse-return-progress-reliability'
+BRANCH = 'fix/infuse-progress-ui-stream-picker-performance'
 BUNDLE = 'com.krystian.nuvio'
 GROUP = 'group.com.krystian.nuvio'
 APP_NAME = 'Nuvio - Krystian'

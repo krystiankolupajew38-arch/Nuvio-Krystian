@@ -8,6 +8,29 @@ final class TraktContinueWatchingOwnershipTests: XCTestCase {
     private var previousSettingsProfileIsPrimary = false
     private var previousContinueWatchingProfileID: String?
 
+    func testTraktSmallPercentagesAreNotFractions() {
+        XCTAssertEqual(TraktProgressService.normalizedProgress(0.5), 0.5)
+        XCTAssertEqual(TraktProgressService.normalizedProgress(1), 1)
+        XCTAssertEqual(TraktProgressService.normalizedProgress(45), 45)
+        XCTAssertNil(TraktProgressService.normalizedProgress(.nan))
+        XCTAssertNil(TraktProgressService.normalizedProgress(.infinity))
+    }
+
+    func testWatchedSeedRetiresOnlyMatchingOlderPauseAndPreservesRewatch() {
+        let now = Date()
+        func seed(_ id: String = "fixture", episode: Int = 3, time: Date, watched: Bool) -> TraktProgressSeed {
+            TraktProgressSeed(contentID: id, type: "series", title: "Fixture", year: nil,
+                progressPercent: watched ? 0 : 40, lastUpdated: time, season: 1,
+                episode: episode, episodeTitle: nil, isUpNext: watched, ids: nil)
+        }
+        let pause = seed(time: now, watched: false)
+        XCTAssertTrue(TraktProgressService.completedSeedSupersedesPlayback(seed(time: now, watched: true), playback: pause))
+        XCTAssertTrue(TraktProgressService.completedSeedSupersedesPlayback(seed(time: now.addingTimeInterval(5), watched: true), playback: pause))
+        XCTAssertFalse(TraktProgressService.completedSeedSupersedesPlayback(seed(time: now.addingTimeInterval(-5), watched: true), playback: pause))
+        XCTAssertFalse(TraktProgressService.completedSeedSupersedesPlayback(seed(episode: 4, time: now, watched: true), playback: pause))
+        XCTAssertFalse(TraktProgressService.completedSeedSupersedesPlayback(seed("other", time: now, watched: true), playback: pause))
+    }
+
     override func setUp() {
         super.setUp()
         previousSettingsProfileID = ProfileSettings.activeProfileID

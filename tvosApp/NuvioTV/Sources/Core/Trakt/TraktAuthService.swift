@@ -1215,6 +1215,7 @@ struct TraktProgressService {
         // Exact external-player seconds have no server equivalent when duration
         // is unknown. Keep them until newer playback or a watched mark replaces them.
         var preservesExactPosition: Bool? = nil
+        var playbackStartedAt: Date? = nil
     }
 
     private struct ContinueWatchingSnapshot {
@@ -1340,7 +1341,8 @@ struct TraktProgressService {
         source sourceOverride: TraktWatchProgressSource? = nil,
         notify: Bool,
         preservesExactPosition: Bool = false,
-        recordedAt: Date = Date()
+        recordedAt: Date = Date(),
+        playbackStartedAt: Date? = nil
     ) -> Bool {
         guard position.isFinite,
               duration.isFinite,
@@ -1363,7 +1365,7 @@ struct TraktProgressService {
 
         // Unknown duration is always incomplete. Preserve the absolute
         // position in the checkpoint until an authoritative duration arrives.
-        let isCompleted = duration > 0 && (position / duration * 100) >= completionPercent
+        let isCompleted = !preservesExactPosition && duration > 0 && (position / duration * 100) >= completionPercent
         if !isCompleted {
             let video = meta.videos?.first {
                 $0.season == season && $0.episode == episode
@@ -1390,7 +1392,8 @@ struct TraktProgressService {
                         episodeThumbnailOverride: video?.thumbnail,
                         isUpNext: false
                     ),
-                    preservesExactPosition: preservesExactPosition
+                    preservesExactPosition: preservesExactPosition,
+                    playbackStartedAt: preservesExactPosition ? playbackStartedAt : nil
                 )
             )
         } else {
@@ -1754,9 +1757,13 @@ struct TraktProgressService {
         let watched = WatchedStore.activeProfileId == profileId ? WatchedStore.items() : []
         for checkpoint in checkpoints {
             let local = checkpoint.item
+            // Infuse can scrobble completion before its final callback arrives.
+            // Compare that watched event with the handoff start, not receipt time;
+            // a watched event from before a new handoff still permits a rewatch.
+            let watchedCutoff = checkpoint.playbackStartedAt ?? local.lastWatchedAt
             if watched.contains(where: {
                 WatchedStore.sameContent($0.meta, local.meta) && $0.season == local.season
-                    && $0.episode == local.episode && $0.watchedAt >= local.lastWatchedAt
+                    && $0.episode == local.episode && $0.watchedAt >= watchedCutoff
                     && $0.sources.contains(source.rawValue)
             }) {
                 confirmedItems.append(local)
@@ -1768,7 +1775,6 @@ struct TraktProgressService {
                 let remote = merged[index]
                 let sameEpisode = remote.season == local.season && remote.episode == local.episode
                 if sameEpisode {
-                    let remoteProgress = remote.duration > 0 ? (remote.position / remote.duration) : 0
                     let remoteIsSubstantiallyNewer = remote.lastWatchedAt > local.lastWatchedAt.addingTimeInterval(30)
                     // Timestamp and episode identity determine whether this is
                     // later playback, not the largest percentage. Rewinding or
@@ -1779,26 +1785,6 @@ struct TraktProgressService {
                         // A genuinely later provider pause can be a rewind. Keep
                         // it as a percentage; do not fabricate seconds for Infuse.
                         merged[index] = remote
-                        confirmedItems.append(local)
-                    } else if remoteIsSubstantiallyNewer && remote.duration > 0 {
-                        // User genuinely continued playback on another device.
-                        // Inherit verified stream duration if remote has an estimated duration.
-                        let resolvedDuration = local.duration > 100 ? local.duration : remote.duration
-                        let resolvedPosition = resolvedDuration * remoteProgress
-                        merged[index] = ContinueWatchingItem(
-                            meta: remote.meta,
-                            streamUrl: local.streamUrl.isEmpty ? remote.streamUrl : local.streamUrl,
-                            position: resolvedPosition,
-                            duration: resolvedDuration,
-                            lastWatchedAt: remote.lastWatchedAt,
-                            season: remote.season,
-                            episode: remote.episode,
-                            released: remote.released ?? local.released,
-                            episodeTitleOverride: remote.episodeTitleOverride ?? local.episodeTitleOverride,
-                            episodeOverviewOverride: remote.episodeOverviewOverride ?? local.episodeOverviewOverride,
-                            episodeThumbnailOverride: remote.episodeThumbnailOverride ?? local.episodeThumbnailOverride,
-                            isUpNext: false
-                        )
                         confirmedItems.append(local)
                     } else {
                         // The callback has exact seconds. Trakt normally has
@@ -2136,11 +2122,12 @@ struct TraktProgressService {
 
     /// A later watched event for the same episode beats an older pause.
     /// Preserve newer pauses to allow intentional replays and rewinds.
-    private static func completedSeedSupersedesPlayback(
+    nonisolated static func completedSeedSupersedesPlayback(
         _ completed: TraktProgressSeed,
         playback: TraktProgressSeed
     ) -> Bool {
-        guard completed.isUpNext, !playback.isUpNext,
+        guard completed.contentID == playback.contentID,
+              completed.isUpNext, !playback.isUpNext,
               completed.season == playback.season,
               completed.episode == playback.episode else { return false }
         return completed.lastUpdated >= playback.lastUpdated
@@ -2372,9 +2359,10 @@ struct TraktProgressService {
         return nil
     }
 
-    private static func normalizedProgress(_ value: Double?) -> Double? {
+    nonisolated static func normalizedProgress(_ value: Double?) -> Double? {
         guard let value, value.isFinite else { return nil }
-        return min(max(value <= 1 ? value * 100 : value, 0), 100)
+        // Trakt reports percentages, including values below one percent.
+        return min(max(value, 0), 100)
     }
 
     private static func traktDate(_ value: String?) -> Date? {
@@ -3590,7 +3578,7 @@ private struct TraktHistoryIDs: Encodable {
     let tmdb: Int?
 }
 
-private struct TraktProgressSeed {
+struct TraktProgressSeed {
     let contentID: String
     let type: String
     let title: String

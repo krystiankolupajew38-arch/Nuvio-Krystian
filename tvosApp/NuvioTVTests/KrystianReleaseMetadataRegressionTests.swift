@@ -49,7 +49,7 @@ final class KrystianReleaseMetadataRegressionTests: XCTestCase {
     }
 
     func testInvalidDatesDoNotSurfaceAsAuthoritative() {
-        for invalid in ["2026-02-30", "2026-13-01", "2026-10-21T99:00:00Z", "garbage", "", "2026-10-21T25:00"] {
+        for invalid in ["2026-02-30", "2026-13-01", "2026-10-21T99:00:00Z", "garbage", "", "2026-10-21T25:00", "2026-10-21T12:60:00Z", "2026-10-21T12:00:60Z", "2026-10-21T12:00:00+24:00", "2026-10-21T12:00:00+01:60"] {
             XCTAssertEqual(EpisodeReleasePolicy.precision(of: invalid), .invalid, "Unexpected valid release: \(invalid)")
             XCTAssertNil(EpisodeReleasePolicy.localReleaseDay(invalid))
             XCTAssertNil(EpisodeReleasePolicy.preferredRelease(primary: invalid, fallback: nil))

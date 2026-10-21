@@ -237,7 +237,7 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
             if let encodedFilename, !encodedFilename.isEmpty {
                 query += "&filename=\(encodedFilename)"
             }
-            if let position, position.isFinite, position >= 0 {
+            if let position, position.isFinite, position >= 0, position < Double(Int.max) {
                 query += "&position=\(Int(position))"
             }
             for sub in encodedSubs.prefix(8) {
@@ -520,10 +520,9 @@ struct ExternalPlaybackSession: Codable, Equatable {
     func sample(for callback: ExternalPlaybackCallback) -> (position: Double, duration: Double)? {
         guard !callback.isError, callback.id == id,
               !meta.isSeries || (season != nil && episode != nil) else { return nil }
-        // Like upstream Nuvio, retain an episode-specific duration captured at
-        // launch. Infuse supplies seconds but does not guarantee duration.
-        // Completion on Trakt remains independent of this display/runtime hint.
-        let runtime = callback.duration ?? duration
+        // Historical ledger durations have no measured/estimated provenance.
+        // Only a duration returned by the player is trustworthy for Infuse.
+        let runtime = callback.duration ?? (externalPlayerName == ExternalPlayer.infuse.rawValue ? nil : duration)
         let position = callback.position ?? callback.progress.flatMap { fraction in
             guard let runtime, runtime.isFinite, runtime >= 60 else { return nil }
             return fraction * runtime
@@ -767,7 +766,8 @@ enum ExternalPlaybackReturnHandler {
                 meta: session.meta, position: position, duration: duration,
                 season: session.season, episode: session.episode, source: source, notify: true,
                 preservesExactPosition: session.externalPlayerName == ExternalPlayer.infuse.rawValue,
-                recordedAt: session.returnedAt ?? Date()
+                recordedAt: session.returnedAt ?? Date(),
+                playbackStartedAt: session.startedAt
             ) else { return .retry }
             // Infuse scrobbles to the user's Trakt account independently.
             // Keep our immediate local checkpoint, but do not send a second

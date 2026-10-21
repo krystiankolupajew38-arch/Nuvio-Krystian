@@ -345,10 +345,7 @@ final class StreamsRepository: ObservableObject {
 
     /// Single-target manifest lookup so ready add-ons do not wait for others.
     private static func loadManifest(url: URL) async -> StreamAddonManifest? {
-        if let cached = await manifestCache.success(for: url) { return cached }
-        guard let fetched = await fetchManifest(url) else { return nil }
-        await manifestCache.storeSuccess(fetched, for: url)
-        return fetched
+        await manifestCache.load(url: url) { await fetchManifest(url) }
     }
 
     private func apply(update: GroupUpdate, requestKey: String, forceLoading: Bool) {
@@ -501,34 +498,12 @@ final class StreamsRepository: ObservableObject {
 
     private static func loadManifestsConcurrently(urls: [URL]) async -> [URL: StreamAddonManifest] {
         var result: [URL: StreamAddonManifest] = [:]
-        var missing: [URL] = []
-
-        for url in urls {
-            if let cached = await manifestCache.success(for: url) {
-                result[url] = cached
-            } else {
-                missing.append(url)
-            }
-        }
-
-        guard !missing.isEmpty else { return result }
-
         await withTaskGroup(of: (URL, StreamAddonManifest?).self) { group in
-            for url in missing {
-                group.addTask {
-                    let manifest = await fetchManifest(url)
-                    return (url, manifest)
-                }
+            for url in Set(urls) {
+                group.addTask { (url, await loadManifest(url: url)) }
             }
             for await (url, manifest) in group {
-                // Success-only: a temporary failure must not block retries on the
-                // next open (that recreated the "only Meteor" missing-addons case).
-                if let manifest {
-                    await manifestCache.storeSuccess(manifest, for: url)
-                    result[url] = manifest
-                } else {
-                    print("[StreamsRepo] manifest fetch failed origin=\(AddonTransportUrls.diagnosticDescription(for: url)) (not cached)")
-                }
+                if let manifest { result[url] = manifest }
             }
         }
         return result
@@ -677,6 +652,24 @@ actor StreamManifestCache {
     }
 
     private var successes: [URL: StreamAddonManifest] = [:]
+    private var inFlight: [URL: (id: UUID, task: Task<StreamAddonManifest?, Never>)] = [:]
+
+    /// Stream and subtitle discovery share one request per URL. Cancelling a
+    /// waiter must not cancel the manifest needed by the other consumer.
+    func load(url: URL, fetch: @escaping @Sendable () async -> StreamAddonManifest?) async -> StreamAddonManifest? {
+        if let cached = successes[url] { return cached }
+        if let pending = inFlight[url] { return await pending.task.value }
+        let id = UUID()
+        let task = Task { await fetch() }
+        inFlight[url] = (id, task)
+        let result = await task.value
+        if inFlight[url]?.id == id {
+            inFlight[url] = nil
+            if let result { storeSuccess(result, for: url) }
+        }
+        return result
+    }
+
 
     func success(for url: URL) -> StreamAddonManifest? {
         successes[url]
@@ -689,6 +682,8 @@ actor StreamManifestCache {
 
     /// Test / diagnostics helper.
     func removeAll() {
+        for pending in inFlight.values { pending.task.cancel() }
+        inFlight.removeAll()
         successes.removeAll()
         Self.tracker.reset()
     }

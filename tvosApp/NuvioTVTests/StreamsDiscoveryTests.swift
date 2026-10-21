@@ -35,6 +35,46 @@ final class StreamsDiscoveryTests: XCTestCase {
         XCTAssertEqual(result.map(\.id), streams.reversed().map(\.id))
     }
 
+    func testListWorkerAtSmallAndLargeProviderSizes() async {
+        for count in [50, 500, 2_000] {
+            let streams = (0..<count).map {
+                NuvioStream(url: "https://example.invalid/\($0).mp4", name: "1080p WEB-DL", description: nil, addonName: "Test", videoSize: Int64($0 + 1))
+            }
+            let groups = [AddonStreamGroup(addonId: "test", displayName: "Test", streams: streams, isLoading: false)]
+            let key = StreamPickerListBuilder.cacheKey(revision: UInt64(count), selectedAddonId: "test", sortOption: .size, includeDebrid: false)
+            let start = Date()
+            let result = await StreamPickerListWorker.shared.build(streams: [], groups: groups, key: key)
+            print("STREAM_LIST_BENCH count=\(count) milliseconds=\(Date().timeIntervalSince(start) * 1000)")
+            XCTAssertEqual(result.map(\.id), streams.reversed().map(\.id))
+            XCTAssertEqual(StreamPickerListBuilder.paginatedSlice(streams: result, limit: 20).count, 20)
+        }
+    }
+
+    func testConcurrentManifestConsumersShareRequestAndFailuresRetry() async {
+        actor Fetcher {
+            var calls = 0
+            func fetch() async -> StreamAddonManifest? {
+                calls += 1
+                try? await Task.sleep(nanoseconds: 20_000_000)
+                return nil
+            }
+        }
+        let cache = StreamManifestCache()
+        let fetcher = Fetcher()
+        let url = URL(string: "https://example.invalid/manifest.json")!
+        await withTaskGroup(of: StreamAddonManifest?.self) { group in
+            for _ in 0..<10 {
+                group.addTask { await cache.load(url: url) { await fetcher.fetch() } }
+            }
+            for await result in group { XCTAssertNil(result) }
+        }
+        let sharedCalls = await fetcher.calls
+        XCTAssertEqual(sharedCalls, 1)
+        _ = await cache.load(url: url) { await fetcher.fetch() }
+        let retriedCalls = await fetcher.calls
+        XCTAssertEqual(retriedCalls, 2)
+    }
+
     func testStreamRequestRetryPolicyRetriesTransientErrorsOnly() {
         XCTAssertFalse(StreamsRepository.StreamRequestRetryPolicy.shouldRetry(URLError(.timedOut)))
         XCTAssertTrue(StreamsRepository.StreamRequestRetryPolicy.shouldRetry(URLError(.networkConnectionLost)))

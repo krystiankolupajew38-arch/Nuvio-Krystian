@@ -222,7 +222,7 @@ class BuildHelperTests(unittest.TestCase):
         b.config = mock.Mock(return_value={'team_id': 'TESTTEAM01', 'device_id': 'test-device'})
         app = self.root / 'NuvioTV.app'
         app.mkdir()
-        info = {'CFBundleIdentifier': kb.BUNDLE, 'CFBundleShortVersionString': '3.4.5', 'CFBundleVersion': '77',
+        info = {'CFBundleIdentifier': kb.BUNDLE, 'CFBundleShortVersionString': kb.version()[0], 'CFBundleVersion': kb.version()[1],
                 'CFBundleSupportedPlatforms': ['AppleTVOS'], 'CFBundleDisplayName': kb.APP_NAME,
                 'CFBundleURLTypes': [{'CFBundleURLSchemes': ['nuvio-krystian']}]}
         (app / 'Info.plist').write_bytes(plistlib.dumps(info))
@@ -310,7 +310,7 @@ class BuildHelperTests(unittest.TestCase):
         b.verify = mock.Mock()
         original = {'bundleIdentifier': 'Nuvio.Sideload', 'version': '3.4.5', 'bundleVersion': '76', 'url': 'original'}
         old = {'bundleIdentifier': kb.BUNDLE, 'version': '3.4.5', 'bundleVersion': '76'}
-        new = dict(old, bundleVersion='77')
+        new = dict(old, version=kb.version()[0], bundleVersion=kb.version()[1])
         return b, [old, original], [new, dict(original)]
 
     def test_installer_success_uses_only_expected_update_and_launch_with_mocked_tools(self):
@@ -365,6 +365,14 @@ class BuildHelperTests(unittest.TestCase):
             self.assertEqual(kb.main(['status', '--json']), 1)
         self.assertNotIn('private-person', output.getvalue())
         self.assertEqual(json.loads(output.getvalue())['status'], 'FAIL')
+
+    def test_prepare_rejects_old_branch_before_build(self):
+        self.assertEqual(kb.BRANCH, 'fix/infuse-progress-ui-stream-picker-performance')
+        b = self.builder()
+        b.source['branch'] = 'fix/infuse-return-progress-reliability'
+        with mock.patch.object(b, 'config'), mock.patch.object(b, 'build') as build, self.assertRaisesRegex(kb.BuildError, 'development branch'):
+            b.prepare()
+        build.assert_not_called()
 
     def test_prepare_requires_current_test_evidence(self):
         b = self.builder()
