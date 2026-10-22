@@ -9107,6 +9107,7 @@ private struct AdvancedSettingsView: View {
 
     @AppStorage(PlaybackTimelineRecorder.enabledKey) private var timelineEnabled = false
     @State private var showingPlaybackHistory = false
+    @State private var showingReleaseHistory = false
     @AppStorage(SettingsKey.fastNavigation) private var fastNavigation = false
     @AppStorage(SettingsKey.playbackDiagnostics) private var playbackDiagnostics = false
     @AppStorage(SettingsKey.releaseDateDiagnostics) private var releaseDateDiagnostics = false
@@ -9151,9 +9152,19 @@ private struct AdvancedSettingsView: View {
 
                 SettingsToggleRow(
                     title: "Release Date Diagnostics",
-                    subtitle: "Log selected metadata provider priority, episode date precision and local day only. No add-on URLs, tokens or stream links.",
-                    isOn: $releaseDateDiagnostics,
+                    subtitle: "Off by default. Keep at most five inspected episodes in memory on this Apple TV.",
+                    isOn: Binding(get: { releaseDateDiagnostics }, set: { enabled in
+                        releaseDateDiagnostics = enabled
+                        ReleaseDateDiagnosticStore.shared.setEnabled(enabled)
+                    }),
                     accentColor: accentColor
+                )
+                SettingsActionRow(
+                    title: "Episode Release Dates",
+                    subtitle: "Inspect release sources, UK time, precision and new-episode decisions.",
+                    value: "Open",
+                    accentColor: accentColor,
+                    action: { showingReleaseHistory = true }
                 )
 
                 #if os(tvOS)
@@ -9281,6 +9292,9 @@ private struct AdvancedSettingsView: View {
         #if os(tvOS)
         .fullScreenCover(isPresented: $showingPlaybackHistory) {
             PlaybackDiagnosticHistoryView(accentColor: accentColor)
+        }
+        .fullScreenCover(isPresented: $showingReleaseHistory) {
+            EpisodeReleaseDiagnosticsView(accentColor: accentColor)
         }
         #endif
     }

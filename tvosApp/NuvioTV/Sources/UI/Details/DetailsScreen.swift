@@ -247,6 +247,7 @@ struct DetailsScreen: View {
                         }
                     },
                     onEpisodeSelected: { video in
+                        viewModel.inspectReleaseDate(for: video)
                         if creatingWatchPartyRoom, let meta = viewModel.uiState.meta {
                             onWatchPartyMediaSelected?(meta, video)
                             return
@@ -258,6 +259,7 @@ struct DetailsScreen: View {
                         startStreamFlow(streamId: streamId, type: "series", reload: !isPreFetched)
                     },
                     onEpisodePlayManually: { video in
+                        viewModel.inspectReleaseDate(for: video)
                         if creatingWatchPartyRoom, let meta = viewModel.uiState.meta {
                             onWatchPartyMediaSelected?(meta, video)
                             return
@@ -268,6 +270,7 @@ struct DetailsScreen: View {
                         let isPreFetched = (viewModel.prefetchedStreamId == streamId && !viewModel.uiState.streams.isEmpty)
                         startStreamFlow(streamId: streamId, type: "series", reload: !isPreFetched, forceManualPicker: true)
                     },
+                    onEpisodeInspectReleaseDate: { video in viewModel.inspectReleaseDate(for: video) },
                     onEpisodeMenuPresented: { isPresented in
                         isEpisodeMenuPresented = isPresented
                     },
@@ -3402,6 +3405,7 @@ struct TvDetailsContent: View {
     var onHostWatchParty: (() -> Void)? = nil
     let onEpisodeSelected: (NuvioVideo) -> Void
     var onEpisodePlayManually: ((NuvioVideo) -> Void)? = nil
+    var onEpisodeInspectReleaseDate: ((NuvioVideo) -> Void)? = nil
     var onEpisodeMenuPresented: ((Bool) -> Void)? = nil
     let onWatchlistClick: () -> Void
     let onWatchedClick: () -> Void
@@ -3848,6 +3852,7 @@ struct TvDetailsContent: View {
                                         stopBackgroundTrailer(manual: false)
                                         onEpisodePlayManually?(video)
                                     } : nil,
+                                    onInspectReleaseDate: onEpisodeInspectReleaseDate,
                                     onEpisodeMenuPresented: { onEpisodeMenuPresented?($0) },
                                     onBack: handleDetailsBack,
                                     episodeFocus: $episodeFocus,
@@ -6953,6 +6958,7 @@ private struct TvDetailsEpisodes: View {
     let onFocus: () -> Void
     let onSelect: (NuvioVideo) -> Void
     var onPlayManually: ((NuvioVideo) -> Void)? = nil
+    var onInspectReleaseDate: ((NuvioVideo) -> Void)? = nil
     let onEpisodeMenuPresented: (Bool) -> Void
     var onBack: (() -> Void)? = nil
     var episodeFocus: FocusState<String?>.Binding
@@ -6988,6 +6994,7 @@ private struct TvDetailsEpisodes: View {
         onFocus: @escaping () -> Void,
         onSelect: @escaping (NuvioVideo) -> Void,
         onPlayManually: ((NuvioVideo) -> Void)? = nil,
+        onInspectReleaseDate: ((NuvioVideo) -> Void)? = nil,
         onEpisodeMenuPresented: @escaping (Bool) -> Void,
         onBack: (() -> Void)? = nil,
         episodeFocus: FocusState<String?>.Binding,
@@ -7005,6 +7012,7 @@ private struct TvDetailsEpisodes: View {
         self.onFocus = onFocus
         self.onSelect = onSelect
         self.onPlayManually = onPlayManually
+        self.onInspectReleaseDate = onInspectReleaseDate
         self.onEpisodeMenuPresented = onEpisodeMenuPresented
         self.onBack = onBack
         self.episodeFocus = episodeFocus
@@ -7225,6 +7233,7 @@ private struct TvDetailsEpisodes: View {
                                 isWatched: !isSeasonWatched
                             )
                         },
+                        onInspectReleaseDate: onInspectReleaseDate != nil ? { onInspectReleaseDate?(video) } : nil,
                         onMenuOpened: { onEpisodeMenuPresented(true) },
                         onMenuClosed: { onEpisodeMenuPresented(false) },
                         action: { onSelect(video) },
@@ -7408,6 +7417,7 @@ private struct TvEpisodeCard: View {
     let onToggleWatched: () -> Void
     let onMarkWatchedUpTo: () -> Void
     let onToggleSeasonWatched: () -> Void
+    var onInspectReleaseDate: (() -> Void)? = nil
     /// Called when a long press raises the context menu, and again when one of
     /// its items closes it — see the `.contextMenu` below.
     let onMenuOpened: () -> Void
@@ -7595,6 +7605,13 @@ private struct TvEpisodeCard: View {
                 onBack?()
             }
             .contextMenu {
+                if ReleaseDateDiagnosticStore.shared.isEnabled, let onInspectReleaseDate {
+                    Button {
+                        performAfterMenuDismissal(onInspectReleaseDate)
+                    } label: {
+                        Label("Inspect Release Date", systemImage: "calendar.badge.clock")
+                    }
+                }
                 if smartStreamSelection, let onPlayManually {
                     Button {
                         performAfterMenuDismissal(onPlayManually)

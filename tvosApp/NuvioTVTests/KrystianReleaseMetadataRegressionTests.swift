@@ -121,4 +121,61 @@ final class KrystianReleaseMetadataRegressionTests: XCTestCase {
         XCTAssertFalse(b.bool(forKey: key))
         XCTAssertTrue(SettingsKey.all.contains(key))
     }
+    func testAbbottEligibilityAtExactLondonBoundary() {
+        let abbott = "2026-10-21T20:30:00-04:00"
+        let dateFormatter = ISO8601DateFormatter()
+        func time(_ utc: String) -> Date { dateFormatter.date(from: utc)! }
+        let london = TimeZone(identifier: "Europe/London")!
+        XCTAssertEqual(EpisodeReleasePolicy.localReleaseDay(abbott, timeZone: london), "2026-10-22")
+        XCTAssertEqual(EpisodeReleasePolicy.releaseState(abbott, now: time("2026-10-21T22:00:00Z"), timeZone: london), .upcoming)
+        XCTAssertEqual(EpisodeReleasePolicy.releaseState(abbott, now: time("2026-10-22T00:29:00Z"), timeZone: london), .airingToday)
+        XCTAssertEqual(EpisodeReleasePolicy.releaseState(abbott, now: time("2026-10-22T00:30:00Z"), timeZone: london), .aired)
+        XCTAssertFalse(EpisodeReleasePolicy.isNewEpisodeDrop(released: abbott, seedWatchedAt: time("2026-10-21T00:00:00Z"), now: time("2026-10-22T00:29:00Z")))
+        XCTAssertTrue(EpisodeReleasePolicy.isNewEpisodeDrop(released: abbott, seedWatchedAt: time("2026-10-21T00:00:00Z"), now: time("2026-10-22T00:30:00Z")))
+    }
+
+    func testTMDBEnrichmentDoesNotReplacePreciseAddonRelease() {
+        let original = NuvioVideo(id: "tt001:6:3", title: "Tryouts", season: 6, episode: 3, released: "2026-10-21T20:30:00-04:00")
+        let tmdb = NuvioVideo(id: "tmdb:1:6:3", title: "Tryouts", season: 6, episode: 3, released: "2026-10-21")
+        let merged = DetailsViewModel.mergeEpisodes(existing: [original], fromTmdb: [tmdb], parentId: "tt001")
+        XCTAssertEqual(merged?.first?.released, original.released)
+        let bad = NuvioVideo(id: original.id, title: original.title, season: 6, episode: 3, released: "invalid")
+        XCTAssertEqual(DetailsViewModel.mergeEpisodes(existing: [bad], fromTmdb: [tmdb], parentId: "tt001")?.first?.released, "2026-10-21")
+    }
+
+    func testCalendarOnlyNeverProvesPreciseNewEpisodeAndMidnightCanBeReal() {
+        let clock = ISO8601DateFormatter()
+        let now = clock.date(from: "2026-10-22T02:30:00Z")!
+        let previous = clock.date(from: "2026-10-20T23:00:00Z")!
+        XCTAssertFalse(EpisodeReleasePolicy.isRecentlyReleased("2026-10-21", within: 60, now: now))
+        XCTAssertFalse(EpisodeReleasePolicy.isNewEpisodeDrop(released: "2026-10-21", seedWatchedAt: previous, now: now))
+        XCTAssertFalse(EpisodeReleasePolicy.isNewEpisodeDrop(released: "2026-10-21T00:00:00", seedWatchedAt: previous, now: now))
+        XCTAssertTrue(EpisodeReleasePolicy.isNewEpisodeDrop(released: "2026-10-21T00:00:00Z", seedWatchedAt: previous, now: now))
+        XCTAssertEqual(EpisodeReleasePolicy.releaseState(nil, now: now), .unknown)
+        XCTAssertEqual(EpisodeReleasePolicy.releaseState("invalid", now: now), .unknown)
+    }
+
+    func testDiagnosticsAreOptInBoundedAndSanitised() {
+        let store = ReleaseDateDiagnosticStore(isEnabled: false)
+        let ep = NuvioVideo(id: "tt1:6:3", title: "Tryouts", season: 6, episode: 3, released: "2026-10-21T20:30:00-04:00")
+        store.record(showTitle: "Abbott Elementary", episode: ep, originalRelease: ep.released, tmdbRelease: "2026-10-21", provider: "Configured metadata", cacheStatus: "Unknown")
+        XCTAssertTrue(store.snapshots.isEmpty)
+        store.setEnabled(true)
+        store.record(showTitle: "Abbott Elementary", episode: ep, originalRelease: ep.released, tmdbRelease: "2026-10-21", provider: "Configured metadata", cacheStatus: "Unknown")
+        XCTAssertEqual(store.snapshots.count, 1)
+        XCTAssertEqual(store.snapshots[0].precision, "exact")
+        XCTAssertEqual(store.snapshots[0].source, "Original add-on metadata")
+        XCTAssertEqual(store.snapshots[0].ukDateTime, "22 October 2026 at 01:30 BST")
+        for i in 1...5 {
+            let other = NuvioVideo(id: "tt1:6:\(i+3)", title: "E\(i)", season: 6, episode: i+3, released: "2026-10-21")
+            store.record(showTitle: "Abbott", episode: other, originalRelease: other.released, tmdbRelease: nil, provider: "Unknown", cacheStatus: "Unknown")
+        }
+        XCTAssertEqual(store.snapshots.count, 5)
+        XCTAssertFalse(store.snapshots.contains(where: { $0.episodeNumber == 3 }))
+        store.record(showTitle: "https://secret.invalid/?token=secret", episode: ep, originalRelease: "https://secret.invalid/?token=secret", tmdbRelease: nil, provider: "https://secret.invalid", cacheStatus: "token=secret")
+        XCTAssertFalse(store.snapshots.map { "\($0.showTitle) \($0.originalRelease) \($0.provider) \($0.cacheStatus)" }.joined().contains("secret"))
+        store.setEnabled(false)
+        XCTAssertTrue(store.snapshots.isEmpty)
+    }
+
 }

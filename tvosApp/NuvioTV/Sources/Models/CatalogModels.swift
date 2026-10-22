@@ -1148,17 +1148,40 @@ enum EpisodeReleasePolicy {
         return ProfileSettings.current.bool(forKey: showUnairedNextUpKey)
     }
 
-    static func hasAired(_ released: String?) -> Bool {
-        // A date-only release (e.g. "2026-08-13") is a calendar-day statement.
-        // Comparing it as absolute UTC time makes "today" flip to "already
-        // aired" once local time passes UTC midnight — 02:00 in UTC+2. Keep it
-        // day-based so an episode airing today stays "today" all day, exactly
-        // as `isAiringToday` compares calendar days.
-        if precision(of: released) == .dateOnly, let day = localReleaseDay(released) {
-            return day < todayIsoDay()
+    enum ReleaseState: String {
+        case upcoming, airingToday, aired, unknown
+    }
+
+    /// Precise timestamps are compared as instants; calendar-only and local
+    /// timestamps never gain a manufactured broadcast time. A past calendar
+    /// day is only evidence that the scheduled day passed, not that a stream exists.
+    static func releaseState(
+        _ released: String?,
+        now: Date = Date(),
+        timeZone: TimeZone = .current
+    ) -> ReleaseState {
+        let kind = precision(of: released, timeZone: timeZone)
+        guard kind != .invalid,
+              let day = localReleaseDay(released, timeZone: timeZone) else { return .unknown }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let todayParts = calendar.dateComponents([.year, .month, .day], from: now)
+        guard let year = todayParts.year, let month = todayParts.month, let date = todayParts.day else {
+            return .unknown
         }
-        guard let releaseDate = releaseDate(for: released) else { return true }
-        return Date() >= releaseDate
+        let today = String(format: "%04d-%02d-%02d", year, month, date)
+        if kind == .exact {
+            guard let instant = releaseDate(for: released, timeZone: timeZone) else { return .unknown }
+            if now >= instant { return .aired }
+        }
+        if day > today { return .upcoming }
+        if day == today { return .airingToday }
+        return .aired
+    }
+
+    static func hasAired(_ released: String?) -> Bool {
+        releaseState(released) == .aired
     }
 
     /// Episodes scheduled for the current calendar day remain visible even
@@ -1206,9 +1229,12 @@ enum EpisodeReleasePolicy {
     /// True when `released` is a real timestamp within the last `days` days.
     /// This mirrors Android's release-alert window, which uses elapsed time
     /// rather than only comparing calendar dates.
-    static func isRecentlyReleased(_ released: String?, within days: Int) -> Bool {
-        guard let releaseDate = releaseDate(for: released) else { return false }
-        let elapsed = Date().timeIntervalSince(releaseDate)
+    static func isRecentlyReleased(_ released: String?, within days: Int, now: Date = Date()) -> Bool {
+        // UTC midnight generated from YYYY-MM-DD is a sorting key, never an
+        // observed release instant. A timezone-less value is also not authoritative.
+        guard precision(of: released) == .exact,
+              let releaseDate = releaseDate(for: released) else { return false }
+        let elapsed = now.timeIntervalSince(releaseDate)
         let window = Double(max(days, 0)) * 24 * 60 * 60
         return elapsed >= 0 && elapsed < window
     }
@@ -1221,10 +1247,11 @@ enum EpisodeReleasePolicy {
     /// news, however recently it aired. So it also has to have released *after*
     /// the seeding episode was watched — the same rule the Android client's
     /// release-alert state uses (`calculateReleaseAlertState`).
-    static func isNewEpisodeDrop(released: String?, seedWatchedAt: Date) -> Bool {
-        guard let releaseDate = releaseDate(for: released),
+    static func isNewEpisodeDrop(released: String?, seedWatchedAt: Date, now: Date = Date()) -> Bool {
+        guard precision(of: released) == .exact,
+              let releaseDate = releaseDate(for: released),
               releaseDate > seedWatchedAt else { return false }
-        return isRecentlyReleased(released, within: newEpisodeWindowDays)
+        return isRecentlyReleased(released, within: newEpisodeWindowDays, now: now)
     }
 
     /// All consumers use this parser. Zoned values are true instants, local
