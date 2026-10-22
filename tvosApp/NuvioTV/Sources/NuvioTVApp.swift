@@ -3735,6 +3735,15 @@ private struct TVMainTabView: View {
         }
     }
 
+    // Only a verified account identity may restore persisted catalog posters.
+    // This deliberately excludes transient loading/signed-out states.
+    private var homePresentationAccountScope: String? {
+        if case let .fullAccount(userId, _) = authManager.authState, !userId.isEmpty {
+            return userId
+        }
+        return nil
+    }
+
     private var homeTabContent: some View {
         TVHomeView(
             store: homeStore,
@@ -3750,6 +3759,7 @@ private struct TVMainTabView: View {
                 catalogRevision: homeCatalogRevision
             ),
             collectionsRevision: homeCollectionsRevision,
+            accountScope: homePresentationAccountScope,
             sessionNeedsReauthentication: sessionNeedsReauthentication,
             onNavigateToDetails: onNavigateToDetails,
             onPlayTitle: onPlayTitle,
@@ -4353,6 +4363,9 @@ struct TVHomeView: View {
     var onProfileGateReadinessChange: (TVHomeContentIdentity, UInt, TVProfileGateReadiness) -> Void = { _, _, _ in }
     let contentIdentity: TVHomeContentIdentity
     let collectionsRevision: UInt
+    /// Verified account identity for a private catalog-only cold-start cache.
+    /// Nil disables disk restoration rather than guessing who owns the data.
+    var accountScope: String? = nil
     var sessionNeedsReauthentication: Bool = false
     let onNavigateToDetails: (String, String) -> Void
     let onPlayTitle: (String, String) -> Void
@@ -7297,10 +7310,27 @@ struct TVHomeView: View {
         let collectionSections = await loadCollectionSections()
         guard store.isCurrentLoad(generation, for: identity) else { return }
         let homeVisibility = TVHomeCatalogOrder.homeVisibilityContext()
-        let previouslyLoadedCatalogSections = store.sections.filter {
+        var previouslyLoadedCatalogSections = store.sections.filter {
             !$0.isCollectionRow
                 && !$0.isLoadingPlaceholder
                 && isHomeCatalogSectionFromEnabledSource($0, context: homeVisibility)
+        }
+        // This snapshot holds catalog posters only. Progress, Next Up and
+        // watched history still come exclusively from their existing owners.
+        // An account/profile/config mismatch never restores any cached rows.
+        if previouslyLoadedCatalogSections.isEmpty,
+           let accountScope,
+           let cached = TVHomePresentationCache.restore(
+                accountScope: accountScope,
+                profileID: identity.profileId,
+                configuration: inputSignature
+           ) {
+            previouslyLoadedCatalogSections = cached.filter {
+                isHomeCatalogSectionFromEnabledSource($0, context: homeVisibility)
+            }
+            if !previouslyLoadedCatalogSections.isEmpty {
+                TVPickerHomeSignposts.mark("HomeCatalogSnapshotRestored")
+            }
         }
         let isColdStart = previouslyLoadedCatalogSections.isEmpty
         // Seeded before the first publish so Home shows its rows'
@@ -7367,6 +7397,17 @@ struct TVHomeView: View {
             )
             store.finishLoad(generation, for: identity)
             lastLoadedInputSignature = inputSignature
+            if receivedCatalogPublication,
+               !repository.homeCatalogLoadWasPartial,
+               let accountScope,
+               !latestCatalogSections.isEmpty {
+                TVHomePresentationCache.scheduleSave(
+                    rows: latestCatalogSections,
+                    accountScope: accountScope,
+                    profileID: identity.profileId,
+                    configuration: inputSignature
+                )
+            }
             // Arm this before clearing isLoading: a partial catalog retry can
             // otherwise reveal Home before the metadata recovery pass starts.
             if !store.hasPresentedHome {

@@ -2,6 +2,61 @@ import XCTest
 @testable import NuvioTV
 
 final class HomeStartupGateTests: XCTestCase {
+    func testPrivateHomeCatalogCacheIsAccountProfileAndConfigurationScoped() {
+        let section = TVHomeSection(
+            id: "catalog-test", title: "Catalog",
+            items: [NuvioMeta(id: "tt1234567", type: "movie", name: "Example")]
+        )
+        let firstAccount = "cache-account-a"
+        let profile = "cache-profile-a"
+        let configuration = "cache-config-a"
+        defer { TVHomePresentationCache.remove(accountScope: firstAccount, profileID: profile) }
+        XCTAssertTrue(TVHomePresentationCache.store(
+            rows: [section], accountScope: firstAccount,
+            profileID: profile, configuration: configuration
+        ))
+        let restored = TVHomePresentationCache.restore(
+            accountScope: firstAccount, profileID: profile, configuration: configuration
+        )
+        XCTAssertEqual(restored?.first?.items.first?.id, "tt1234567")
+        XCTAssertNil(TVHomePresentationCache.restore(
+            accountScope: "cache-account-b", profileID: profile, configuration: configuration
+        ))
+        XCTAssertNil(TVHomePresentationCache.restore(
+            accountScope: firstAccount, profileID: "cache-profile-b", configuration: configuration
+        ))
+        XCTAssertNil(TVHomePresentationCache.restore(
+            accountScope: firstAccount, profileID: profile, configuration: "changed-config"
+        ))
+    }
+
+    func testPrivateHomeCatalogCacheExpiresAndRejectsFutureSnapshots() {
+        let account = "cache-expiration-a"
+        let profile = "cache-expiration-profile"
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        defer { TVHomePresentationCache.remove(accountScope: account, profileID: profile) }
+        let section = TVHomeSection(
+            id: "catalog-test", title: "Catalog",
+            items: [NuvioMeta(id: "tt1234568", type: "movie", name: "Example")]
+        )
+        XCTAssertTrue(TVHomePresentationCache.store(
+            rows: [section], accountScope: account, profileID: profile,
+            configuration: "config", now: base
+        ))
+        XCTAssertNotNil(TVHomePresentationCache.restore(
+            accountScope: account, profileID: profile, configuration: "config",
+            now: base.addingTimeInterval(1)
+        ))
+        XCTAssertNil(TVHomePresentationCache.restore(
+            accountScope: account, profileID: profile, configuration: "config",
+            now: base.addingTimeInterval(TVHomePresentationCache.lifetime + 1)
+        ))
+        XCTAssertNil(TVHomePresentationCache.restore(
+            accountScope: account, profileID: profile, configuration: "config",
+            now: base.addingTimeInterval(-1)
+        ))
+    }
+
     func testCatalogReadinessCanReleaseBeforeRemoteProgressCompletes() {
         var gate = TVHomeStartupGate()
         XCTAssertFalse(gate.update(elapsed: 0.2, isReady: false))
