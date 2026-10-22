@@ -5096,11 +5096,18 @@ struct TVHomeView: View {
                 return
             }
             guard isActive else { return }
+            refreshWatchedTitles()
+            if usesRemoteProgress, selectedProgressSource == .trakt {
+                // Home remains mounted behind Details. Retire a completed
+                // Resume card immediately and fetch the now-eligible Next Up
+                // without waiting for the viewer to navigate Home again.
+                refreshRemoteContinueWatchingImmediately()
+                scheduleContinueWatchingRefresh()
+            }
             if isFullScreenOverlayPresented {
                 pendingContinueWatchingRefreshAfterOverlay = true
                 return
             }
-            refreshWatchedTitles()
             // A watched mark can be the only history left for a completed
             // series. Rebuild the local row so a newly aired episode can seed a
             // fresh "Airs Today" card even after the old row was retired.

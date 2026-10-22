@@ -733,9 +733,14 @@ enum ExternalPlaybackReturnHandler {
             // Trakt may scrobble in the middle of this same Infuse handoff.
             // Its newer server timestamp does not supersede the final exact
             // callback seconds; keep the callback authoritative on return.
-            if let row = WatchedStore.items().first(where: {
-                WatchedStore.sameContent($0.meta, session.meta) && $0.season == session.season && $0.episode == session.episode
-            }), row.watchedAt > startedAt,
+            // With Infuse + Trakt a watched event during this handoff is
+            // completion evidence, not proof of a later unrelated callback.
+            // Persist its exact seconds, then let session-aware reconciliation
+            // retire the now-complete handoff without a duplicate scrobble.
+            if !infuseWithTrakt,
+               let row = WatchedStore.items().first(where: {
+                   WatchedStore.sameContent($0.meta, session.meta) && $0.season == session.season && $0.episode == session.episode
+               }), row.watchedAt > startedAt,
                row.lastCountedPlaybackIDsBySource[source.rawValue] != session.id { return .superseded }
         }
 
