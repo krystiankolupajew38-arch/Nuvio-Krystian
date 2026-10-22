@@ -1196,6 +1196,12 @@ enum EpisodeReleasePolicy {
         candidateSeason: Int?,
         released: String?
     ) -> Bool {
+        // Missing metadata is not evidence of a future broadcast. Preserve
+        // existing Next Up fallback without claiming a confirmed air date.
+        // Malformed nonempty dates are not treated as missing.
+        if released == nil || released?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+            return true
+        }
         let isSeasonRollover = seasonSortKey(candidateSeason ?? 0) != seasonSortKey(watchedSeason ?? 0)
         if !isSeasonRollover {
             return showUnairedNextUp || isAiringToday(released) || hasAired(released)
