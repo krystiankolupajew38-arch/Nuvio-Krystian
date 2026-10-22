@@ -8464,8 +8464,19 @@ struct TVHomeView: View {
 
     private func scheduleContinueWatchingRefresh() {
         guard collectionHome == nil else { return }
+        // Auth, Home appearance, and provider-change notifications can arrive
+        // in the same run-loop window. Collapse that burst into one remote
+        // refresh instead of cancelling and restarting network work repeatedly.
+        // The immediate local Infuse callback presentation happens separately;
+        // it is never held behind this short presentation-only debounce.
         continueWatchingRefreshTask?.cancel()
         continueWatchingRefreshTask = Task {
+            do {
+                try await Task.sleep(for: .milliseconds(80))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, isActive, collectionHome == nil else { return }
             await refreshContinueWatchingFromSelectedSource()
         }
     }
