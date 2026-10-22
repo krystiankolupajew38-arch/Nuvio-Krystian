@@ -3238,7 +3238,9 @@ struct TraktHistoryService {
         guard saved else { return false }
         // Even an IDENTICAL watched snapshot must retire an obsolete pause.
         // Reuse episode-level ledger cleanup; progress from a newer rewatch wins.
-        ContinueWatchingStore.removeWatched(WatchedStore.items())
+        ContinueWatchingStore.removeWatched(WatchedStore.items().filter {
+            $0.sources.contains(TraktWatchProgressSource.trakt.rawValue)
+        })
         TraktProgressService.reconcileTraktWatchedHistory(profileId: targetProfileId)
         return true
     }
