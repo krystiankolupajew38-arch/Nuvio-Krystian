@@ -3027,14 +3027,24 @@ enum StreamPickerListBuilder {
         }
         // Action / informational items remain anchored at their returned positions,
         // while playable video streams are sorted around them.
-        let actionItemIndices = streams.enumerated().filter { $0.element.isNotPlayable }
-        if !actionItemIndices.isEmpty {
+        if streams.contains(where: \.isNotPlayable) {
             let playableOnly = streams.filter { !$0.isNotPlayable }
-            let sortedPlayable = sortPlayableStreams(playableOnly, by: option, preserveAddonStreams: preserveAddonStreams, cachedFacts: cachedFacts)
-            var result = sortedPlayable
-            for item in actionItemIndices {
-                let insertIndex = min(item.offset, result.count)
-                result.insert(item.element, at: insertIndex)
+            let sortedPlayable = sortPlayableStreams(
+                playableOnly, by: option,
+                preserveAddonStreams: preserveAddonStreams, cachedFacts: cachedFacts
+            )
+            // Keep helper/action cards at the exact provider positions, with
+            // sorted playable cards filling the remaining slots. Repeated
+            // Array.insert was quadratic for add-ons returning many actions.
+            var result: [NuvioStream] = []
+            result.reserveCapacity(streams.count)
+            var nextPlayable = sortedPlayable.makeIterator()
+            for original in streams {
+                if original.isNotPlayable {
+                    result.append(original)
+                } else if let playable = nextPlayable.next() {
+                    result.append(playable)
+                }
             }
             return result
         }
@@ -7907,6 +7917,9 @@ private struct TvStreamPickerOverlay: View {
     @State private var restoredSourceFocusID: String?
     @State private var pickerProfileID: String?
     @State private var pickerIsVisible = false
+    /// Invalidate delayed focus repair when a newer focus transition occurs
+    /// or the picker closes/reopens within the debounce window.
+    @State private var focusRecoveryGeneration: UInt = 0
     @State private var streamBadgeSettings = StreamBadgeSettingsStore.snapshot
     @State private var showRefreshToast = false
     @State private var isRefreshing = false
@@ -8038,6 +8051,7 @@ private struct TvStreamPickerOverlay: View {
             // lands on the All chip; seedStreamFocusIfNeeded hands focus to the
             // first card once results exist.
             .onAppear {
+                focusRecoveryGeneration &+= 1
                 pickerIsVisible = true
                 TVPickerHomeSignposts.mark("StreamPickerAppeared")
                 pickerProfileID = ProfileSettings.activeProfileID
@@ -8071,6 +8085,8 @@ private struct TvStreamPickerOverlay: View {
             // snaps focus back to the first stream (the reported bug), so we
             // debounce and bail when focus has already landed somewhere.
             .onChange(of: focusedItem) { _, newValue in
+                focusRecoveryGeneration &+= 1
+                let recoveryGeneration = focusRecoveryGeneration
                 visibleStreamLimit = StreamPickerListBuilder.limitAfterFocus(
                     newValue, streams: displayedStreams, currentLimit: visibleStreamLimit
                 )
@@ -8083,6 +8099,7 @@ private struct TvStreamPickerOverlay: View {
                     // The delayed nil-focus recovery must not steal focus after
                     // dismissal, profile change or another navigation event.
                     guard pickerIsVisible,
+                          focusRecoveryGeneration == recoveryGeneration,
                           pickerProfileID == ProfileSettings.activeProfileID,
                           focusedItem == nil else { return }
                     seedInitialFocus()
@@ -8094,6 +8111,7 @@ private struct TvStreamPickerOverlay: View {
                 streamBadgeSettingsRevision &+= 1
             }
             .onDisappear {
+                focusRecoveryGeneration &+= 1
                 pickerIsVisible = false
                 refreshToastTask?.cancel()
             }

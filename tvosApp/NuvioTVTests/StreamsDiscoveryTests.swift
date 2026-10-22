@@ -12,6 +12,50 @@ import XCTest
 private enum TestStreamError: Error { case failed }
 
 final class StreamsDiscoveryTests: XCTestCase {
+    func testSortedActionItemsKeepExactSlotsAcrossLargeMixedResults() {
+        let streams = (0..<2_000).map { index in
+            NuvioStream(
+                url: "https://example.invalid/\(index).mp4",
+                name: "1080p WEB-DL",
+                description: nil,
+                addonName: "Mixed",
+                videoSize: Int64(index + 1),
+                notPlayable: index.isMultiple(of: 3)
+            )
+        }
+        let sorted = StreamPickerListBuilder.sorted(streams, by: .size)
+        XCTAssertEqual(sorted.count, streams.count)
+        for index in streams.indices where streams[index].isNotPlayable {
+            XCTAssertEqual(sorted[index].id, streams[index].id)
+        }
+        let reorderedPlayable = sorted.filter { !$0.isNotPlayable }
+        XCTAssertEqual(
+            reorderedPlayable.map(\.id),
+            streams.filter { !$0.isNotPlayable }.reversed().map(\.id)
+        )
+    }
+
+    func testSortedActionsRemainInPlaceAtLeadingAndTrailingBoundaries() {
+        let first = NuvioStream(
+            url: "https://example.invalid/a", name: "Action",
+            description: nil, addonName: "Mixed", notPlayable: true
+        )
+        let low = NuvioStream(
+            url: "https://example.invalid/low.mp4", name: "1080p",
+            description: nil, addonName: "Mixed", videoSize: 1
+        )
+        let high = NuvioStream(
+            url: "https://example.invalid/high.mp4", name: "1080p",
+            description: nil, addonName: "Mixed", videoSize: 100
+        )
+        let last = NuvioStream(
+            url: "https://example.invalid/z", name: "Action",
+            description: nil, addonName: "Mixed", notPlayable: true
+        )
+        let result = StreamPickerListBuilder.sorted([first, low, high, last], by: .size)
+        XCTAssertEqual(result.map(\.id), [first.id, high.id, low.id, last.id])
+    }
+
     func testUnavailableAndActionStreamsWaitForFinalProviderPresentation() {
         let unavailable = NuvioStream(
             url: "https://example.invalid/unavailable.mp4",
