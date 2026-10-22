@@ -5104,6 +5104,36 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
         )
     }
 
+    func testMissingNextUpReleaseDateFallbackDoesNotAssertAired() {
+        let settings = ProfileSettings.current
+        let previous = settings.object(forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+        settings.set(false, forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+        defer {
+            if let previous {
+                settings.set(previous, forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+            } else {
+                settings.removeObject(forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+            }
+        }
+        for candidateSeason in [1, 2] {
+            XCTAssertTrue(EpisodeReleasePolicy.shouldSurfaceNextEpisode(
+                watchedSeason: 1, candidateSeason: candidateSeason, released: nil
+            ))
+            XCTAssertTrue(EpisodeReleasePolicy.shouldSurfaceNextEpisode(
+                watchedSeason: 1, candidateSeason: candidateSeason, released: "  "
+            ))
+            XCTAssertFalse(EpisodeReleasePolicy.shouldSurfaceNextEpisode(
+                watchedSeason: 1, candidateSeason: candidateSeason, released: "invalid"
+            ))
+            XCTAssertFalse(EpisodeReleasePolicy.shouldSurfaceNextEpisode(
+                watchedSeason: 1, candidateSeason: candidateSeason, released: "2099-01-01"
+            ))
+        }
+        XCTAssertEqual(EpisodeReleasePolicy.releaseState(nil), .unknown)
+        XCTAssertFalse(EpisodeReleasePolicy.hasAired(nil))
+        XCTAssertFalse(EpisodeReleasePolicy.isRecentlyReleased(nil, within: 60))
+    }
+
     func testContinueWatchingNextUpSortMovesSuggestionsFirst() {
         let now = Date()
         let resume = ContinueWatchingItem(
