@@ -1374,6 +1374,7 @@ struct TraktProgressService {
 
         let profileId = ContinueWatchingStore.activeProfileId
         let source = sourceOverride ?? TraktSettingsStore.watchProgressSource
+        let accountID = progressAccountID(source: source, profileId: profileId)
         print("[TraktProgressService] recordLocalPlayback: meta=\(meta.id) S\(season.map(String.init) ?? "nil")E\(episode.map(String.init) ?? "nil"), pos=\(position)/\(duration), source=\(source.rawValue), notify=\(notify)")
         let completionPercent = source == .mdblist ? MdbListProgressService.completionPercent : Self.completionPercent
         // Going back to a title retires the removal the user made earlier, so a
@@ -1383,6 +1384,7 @@ struct TraktProgressService {
         checkpoints.removeAll {
             $0.profileId == profileId
                 && $0.source == source
+                && ($0.accountID == nil || $0.accountID == accountID)
                 && WatchedStore.sameContent($0.item.meta, meta)
                 && $0.item.season == season && $0.item.episode == episode
         }
@@ -1418,7 +1420,7 @@ struct TraktProgressService {
                     ),
                     preservesExactPosition: preservesExactPosition,
                     playbackStartedAt: preservesExactPosition ? playbackStartedAt : nil,
-                    accountID: progressAccountID(source: source, profileId: profileId)
+                    accountID: accountID
                 )
             )
         } else {
@@ -1881,43 +1883,42 @@ struct TraktProgressService {
 
         for checkpoint in owned where checkpoint.retiredByWatchedAt == nil {
             let local = checkpoint.item
-            if let index = merged.firstIndex(where: { WatchedStore.sameContent($0.meta, local.meta) }) {
+            // Provider presentation may contain one row per show, but local
+            // resume positions belong to individual episodes. Never let an E4
+            // row replace or retire a separate unfinished E3 checkpoint.
+            if let index = merged.firstIndex(where: {
+                WatchedStore.sameContent($0.meta, local.meta)
+                    && $0.season == local.season && $0.episode == local.episode
+            }) {
                 let remote = merged[index]
-                let sameEpisode = remote.season == local.season && remote.episode == local.episode
-                if sameEpisode {
-                    let remoteIsSubstantiallyNewer = remote.lastWatchedAt > local.lastWatchedAt.addingTimeInterval(30)
-                    if remoteIsSubstantiallyNewer, remote.resumeProgressFraction != nil {
-                        // Later playback may be a cross-device rewind.
-                        confirmedItems.append(local)
-                    } else {
-                        // Only a near-contemporaneous provider percentage may
-                        // enrich the display; it never becomes fabricated seconds.
-                        let percentageIsFromSameRecentPlayback =
-                            remote.lastWatchedAt >= local.lastWatchedAt.addingTimeInterval(-300)
-                            && remote.lastWatchedAt <= local.lastWatchedAt.addingTimeInterval(30)
-                        let displayPercent = local.duration <= 0
-                            && percentageIsFromSameRecentPlayback
-                            ? remote.explicitProgressPercent : nil
-                        merged[index] = ContinueWatchingItem(
-                            meta: remote.meta,
-                            streamUrl: local.streamUrl.isEmpty ? remote.streamUrl : local.streamUrl,
-                            position: local.position,
-                            duration: local.duration,
-                            lastWatchedAt: max(local.lastWatchedAt, remote.lastWatchedAt),
-                            season: local.season,
-                            episode: local.episode,
-                            released: local.released ?? remote.released,
-                            episodeTitleOverride: local.episodeTitleOverride ?? remote.episodeTitleOverride,
-                            episodeOverviewOverride: local.episodeOverviewOverride ?? remote.episodeOverviewOverride,
-                            episodeThumbnailOverride: local.episodeThumbnailOverride ?? remote.episodeThumbnailOverride,
-                            isUpNext: false,
-                            explicitProgressPercent: displayPercent
-                        )
-                    }
-                } else if remote.lastWatchedAt > local.lastWatchedAt.addingTimeInterval(1) {
+                let remoteIsSubstantiallyNewer = remote.lastWatchedAt > local.lastWatchedAt.addingTimeInterval(30)
+                if remoteIsSubstantiallyNewer, remote.resumeProgressFraction != nil {
+                    // Later playback of this exact episode may be a cross-device rewind.
                     confirmedItems.append(local)
                 } else {
-                    merged[index] = local
+                    // Only a near-contemporaneous provider percentage may
+                    // enrich the display; it never becomes fabricated seconds.
+                    let percentageIsFromSameRecentPlayback =
+                        remote.lastWatchedAt >= local.lastWatchedAt.addingTimeInterval(-300)
+                        && remote.lastWatchedAt <= local.lastWatchedAt.addingTimeInterval(30)
+                    let displayPercent = local.duration <= 0
+                        && percentageIsFromSameRecentPlayback
+                        ? remote.explicitProgressPercent : nil
+                    merged[index] = ContinueWatchingItem(
+                        meta: remote.meta,
+                        streamUrl: local.streamUrl.isEmpty ? remote.streamUrl : local.streamUrl,
+                        position: local.position,
+                        duration: local.duration,
+                        lastWatchedAt: max(local.lastWatchedAt, remote.lastWatchedAt),
+                        season: local.season,
+                        episode: local.episode,
+                        released: local.released ?? remote.released,
+                        episodeTitleOverride: local.episodeTitleOverride ?? remote.episodeTitleOverride,
+                        episodeOverviewOverride: local.episodeOverviewOverride ?? remote.episodeOverviewOverride,
+                        episodeThumbnailOverride: local.episodeThumbnailOverride ?? remote.episodeThumbnailOverride,
+                        isUpNext: false,
+                        explicitProgressPercent: displayPercent
+                    )
                 }
             } else {
                 merged.append(local)
@@ -1927,6 +1928,7 @@ struct TraktProgressService {
         if !confirmedItems.isEmpty {
             let remaining = checkpoints.filter { checkpoint in
                 !(checkpoint.profileId == profileId && checkpoint.source == source
+                    && (checkpoint.accountID == nil || checkpoint.accountID == accountID)
                     && confirmedItems.contains { confirmed in
                         WatchedStore.sameContent(checkpoint.item.meta, confirmed.meta)
                             && checkpoint.item.season == confirmed.season
