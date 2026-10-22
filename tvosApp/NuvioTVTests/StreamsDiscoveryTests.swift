@@ -12,6 +12,26 @@ import XCTest
 private enum TestStreamError: Error { case failed }
 
 final class StreamsDiscoveryTests: XCTestCase {
+    func testDelayedFocusRecoveryCannotStealFocusAfterReopenOrProfileSwitch() {
+        func allowed(
+            visible: Bool = true,
+            current: UInt = 3, scheduled: UInt = 3,
+            profile: String? = "first", pickerProfile: String? = "first",
+            focused: String? = nil
+        ) -> Bool {
+            StreamPickerFocusRecoveryPolicy.canRestore(
+                visible: visible, currentGeneration: current,
+                requestedGeneration: scheduled, currentProfileID: profile,
+                pickerProfileID: pickerProfile, focusedID: focused
+            )
+        }
+        XCTAssertTrue(allowed())
+        XCTAssertFalse(allowed(visible: false))
+        XCTAssertFalse(allowed(current: 4))
+        XCTAssertFalse(allowed(profile: "second"))
+        XCTAssertFalse(allowed(focused: "stream-2"))
+    }
+
     func testSortedActionItemsKeepExactSlotsAcrossLargeMixedResults() {
         let streams = (0..<2_000).map { index in
             NuvioStream(

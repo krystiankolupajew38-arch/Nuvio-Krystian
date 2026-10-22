@@ -2898,6 +2898,16 @@ enum StreamSortOption: String, CaseIterable, Identifiable {
 /// Pure stream-list derivation for the tvOS stream picker. Kept free of view
 /// state so focus movement cannot re-filter/sort, and unit tests can assert
 /// caching/identity behavior without mounting SwiftUI.
+enum StreamPickerFocusRecoveryPolicy {
+    static func canRestore(
+        visible: Bool, currentGeneration: UInt, requestedGeneration: UInt,
+        currentProfileID: String?, pickerProfileID: String?, focusedID: String?
+    ) -> Bool {
+        visible && currentGeneration == requestedGeneration
+            && currentProfileID == pickerProfileID && focusedID == nil
+    }
+}
+
 enum StreamPickerListBuilder {
     /// Streams for the current add-on filter, preserving group order when "All".
     static func sourceStreams(
@@ -8098,10 +8108,14 @@ private struct TvStreamPickerOverlay: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     // The delayed nil-focus recovery must not steal focus after
                     // dismissal, profile change or another navigation event.
-                    guard pickerIsVisible,
-                          focusRecoveryGeneration == recoveryGeneration,
-                          pickerProfileID == ProfileSettings.activeProfileID,
-                          focusedItem == nil else { return }
+                    guard StreamPickerFocusRecoveryPolicy.canRestore(
+                        visible: pickerIsVisible,
+                        currentGeneration: focusRecoveryGeneration,
+                        requestedGeneration: recoveryGeneration,
+                        currentProfileID: ProfileSettings.activeProfileID,
+                        pickerProfileID: pickerProfileID,
+                        focusedID: focusedItem
+                    ) else { return }
                     seedInitialFocus()
                 }
             }
