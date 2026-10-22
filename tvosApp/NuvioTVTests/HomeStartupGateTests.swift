@@ -5,7 +5,7 @@ final class HomeStartupGateTests: XCTestCase {
     func testPrivateHomeCatalogCacheIsAccountProfileAndConfigurationScoped() {
         let section = TVHomeSection(
             id: "catalog-test", title: "Catalog",
-            items: [NuvioMeta(id: "tt1234567", type: "movie", name: "Example")]
+            items: [NuvioMeta(id: "tt1234567", name: "Example", type: "movie")]
         )
         let firstAccount = "cache-account-a"
         let profile = "cache-profile-a"
@@ -37,7 +37,7 @@ final class HomeStartupGateTests: XCTestCase {
         defer { TVHomePresentationCache.remove(accountScope: account, profileID: profile) }
         let section = TVHomeSection(
             id: "catalog-test", title: "Catalog",
-            items: [NuvioMeta(id: "tt1234568", type: "movie", name: "Example")]
+            items: [NuvioMeta(id: "tt1234568", name: "Example", type: "movie")]
         )
         XCTAssertTrue(TVHomePresentationCache.store(
             rows: [section], accountScope: account, profileID: profile,
