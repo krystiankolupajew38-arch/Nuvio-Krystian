@@ -369,6 +369,68 @@ extension TraktContinueWatchingOwnershipTests {
     }
 
     @MainActor
+    func testDistinctEpisodeCheckpointsSurviveReconciliationWithAnotherEpisodeRemoteRow() {
+        let show = NuvioMeta(id: "episode-identity-\(profileA)", name: "Episode identity", type: "series")
+        defer { TraktProgressService.forgetLocalPlayback(meta: show, notify: false) }
+        let now = Date()
+        XCTAssertTrue(TraktProgressService.recordLocalPlayback(
+            meta: show, position: 303, duration: 0, season: 1, episode: 3,
+            source: .trakt, notify: false, preservesExactPosition: true,
+            recordedAt: now.addingTimeInterval(-20), playbackStartedAt: now.addingTimeInterval(-50)
+        ))
+        XCTAssertTrue(TraktProgressService.recordLocalPlayback(
+            meta: show, position: 404, duration: 0, season: 1, episode: 4,
+            source: .trakt, notify: false, preservesExactPosition: true,
+            recordedAt: now.addingTimeInterval(-10), playbackStartedAt: now.addingTimeInterval(-30)
+        ))
+        let remoteE4 = ContinueWatchingItem(
+            meta: show, streamUrl: "", position: 0, duration: 0,
+            lastWatchedAt: now.addingTimeInterval(-15), season: 1, episode: 4,
+            explicitProgressPercent: 22
+        )
+        for _ in 0..<2 {
+            let items = TraktProgressService.mergingLocalPlaybackCheckpoints(
+                into: [remoteE4], source: .trakt
+            )
+            XCTAssertEqual(Set(items.compactMap(\.episode)), Set([3, 4]))
+            XCTAssertEqual(items.first(where: { $0.episode == 3 })?.position, 303)
+            XCTAssertEqual(items.first(where: { $0.episode == 4 })?.position, 404)
+        }
+        TraktProgressService.reloadCheckpointsForTesting()
+        let persisted = TraktProgressService.mergingLocalPlaybackCheckpoints(into: [], source: .trakt)
+        XCTAssertEqual(Set(persisted.compactMap(\.episode)), Set([3, 4]))
+    }
+
+    @MainActor
+    func testNewerRemoteEpisodeRewindDoesNotDeleteDifferentEpisode() {
+        let show = NuvioMeta(id: "rewind-isolation-\(profileA)", name: "Rewind", type: "series")
+        defer { TraktProgressService.forgetLocalPlayback(meta: show, notify: false) }
+        let now = Date()
+        for episode in [3, 4] {
+            XCTAssertTrue(TraktProgressService.recordLocalPlayback(
+                meta: show, position: Double(episode * 100), duration: 0,
+                season: 1, episode: episode, source: .trakt, notify: false,
+                preservesExactPosition: true, recordedAt: now.addingTimeInterval(-120),
+                playbackStartedAt: now.addingTimeInterval(-180)
+            ))
+        }
+        let rewindE3 = ContinueWatchingItem(
+            meta: show, streamUrl: "", position: 0, duration: 0,
+            lastWatchedAt: now, season: 1, episode: 3,
+            explicitProgressPercent: 8
+        )
+        let result = TraktProgressService.mergingLocalPlaybackCheckpoints(
+            into: [rewindE3], source: .trakt
+        )
+        XCTAssertEqual(result.first(where: { $0.episode == 3 })?.explicitProgressPercent, 8)
+        XCTAssertEqual(result.first(where: { $0.episode == 4 })?.position, 400)
+        XCTAssertEqual(
+            TraktProgressService.mergingLocalPlaybackCheckpoints(into: [], source: .trakt)
+                .first(where: { $0.episode == 4 })?.position, 400
+        )
+    }
+
+    @MainActor
     func testPartialExternalCheckpointNotifiesMountedViewsAndKeepsExactSeconds() {
         let show = NuvioMeta(id: "partial-update-\(profileA)", name: "Partial", type: "series")
         defer { TraktProgressService.forgetLocalPlayback(meta: show, notify: false) }
