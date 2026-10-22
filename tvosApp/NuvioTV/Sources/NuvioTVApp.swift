@@ -225,6 +225,23 @@ enum TVHomeDebugTrace {
     }
 }
 
+/**
+ Instruments Points of Interest events for the stream picker and Home startup.
+ Event names are fixed: never emit content IDs, source URLs, tokens or profile IDs.
+ These markers intentionally do not claim a visual frame or focus was accepted
+ by the physical focus engine; compare their timestamps with device recordings.
+ */
+enum TVPickerHomeSignposts {
+    private static let signposter = OSSignposter(
+        subsystem: "com.krystian.nuvio",
+        category: "HomeStreamPerformance"
+    )
+
+    static func mark(_ stage: StaticString) {
+        signposter.emitEvent(stage)
+    }
+}
+
 enum TVScreen: Equatable, CustomStringConvertible {
     case login
     case profileSelection
@@ -1113,6 +1130,7 @@ struct ContentView: View {
     /// Empty or failed loads get a bounded escape. Populated content waits for
     /// Home's native focus acknowledgement, even after the deadline.
     private func beginProfileGate() {
+        TVPickerHomeSignposts.mark("ProfileGateStarted")
         profileGateTask?.cancel()
         profileGateLiftTask?.cancel()
         profileGateGeneration &+= 1
@@ -1198,6 +1216,7 @@ struct ContentView: View {
         profileGateLiftTask = nil
         profileGateStartedAt = nil
         guard isPreparingProfile else { return }
+        TVPickerHomeSignposts.mark("ProfileGateReleased")
         withAnimation(.easeInOut(duration: 0.22)) {
             isPreparingProfile = false
         }
@@ -3716,6 +3735,15 @@ private struct TVMainTabView: View {
         }
     }
 
+    // Only a verified account identity may restore persisted catalog posters.
+    // This deliberately excludes transient loading/signed-out states.
+    private var homePresentationAccountScope: String? {
+        if case let .fullAccount(userId, _) = authManager.authState, !userId.isEmpty {
+            return userId
+        }
+        return nil
+    }
+
     private var homeTabContent: some View {
         TVHomeView(
             store: homeStore,
@@ -3731,6 +3759,7 @@ private struct TVMainTabView: View {
                 catalogRevision: homeCatalogRevision
             ),
             collectionsRevision: homeCollectionsRevision,
+            accountScope: homePresentationAccountScope,
             sessionNeedsReauthentication: sessionNeedsReauthentication,
             onNavigateToDetails: onNavigateToDetails,
             onPlayTitle: onPlayTitle,
@@ -4334,6 +4363,9 @@ struct TVHomeView: View {
     var onProfileGateReadinessChange: (TVHomeContentIdentity, UInt, TVProfileGateReadiness) -> Void = { _, _, _ in }
     let contentIdentity: TVHomeContentIdentity
     let collectionsRevision: UInt
+    /// Verified account identity for a private catalog-only cold-start cache.
+    /// Nil disables disk restoration rather than guessing who owns the data.
+    var accountScope: String? = nil
     var sessionNeedsReauthentication: Bool = false
     let onNavigateToDetails: (String, String) -> Void
     let onPlayTitle: (String, String) -> Void
@@ -4804,10 +4836,15 @@ struct TVHomeView: View {
         }
         .task(id: "\(contentIdentity.profileId):\(store.hasPresentedHome)") {
             guard collectionHome == nil, !store.hasPresentedHome else { return }
+            TVPickerHomeSignposts.mark("HomeReadinessGateStarted")
             var gate = TVHomeStartupGate()
             let clock = ContinuousClock()
             let started = clock.now
             while !Task.isCancelled {
+                // A real catalog card can be shown without waiting for
+                // unrelated Trakt/Nuvio Sync work. Remote progress continues
+                // independently; its existing reconciliation owns the row.
+                let hasUsableCatalog = profileGateStartupFocusTarget != nil
                 let progressReady = !continueWatchingVisible || (
                     initialProgressRefreshFinished
                     && NuvioSyncManager.current?.isHomePullPending != true
@@ -4816,10 +4853,11 @@ struct TVHomeView: View {
                 let elapsed = started.duration(to: clock.now).components
                 if gate.update(
                     elapsed: Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18,
-                    isReady: !isLoading && progressReady
+                    isReady: hasUsableCatalog || (!isLoading && progressReady)
                 ) {
                     refreshContinueWatching()
                     store.hasPresentedHome = true
+                    TVPickerHomeSignposts.mark("HomeReadinessGateReleased")
                     return
                 }
                 do { try await Task.sleep(for: .milliseconds(100)) }
@@ -4845,6 +4883,7 @@ struct TVHomeView: View {
         }
         .onAppear {
             TVHomeDebugTrace.startWatchdogIfNeeded()
+            TVPickerHomeSignposts.mark("HomeViewAppeared")
             reportProfileGateReadiness()
             // A TabView may recreate Home instead of keeping it mounted. Arm
             // before its saved focus is restored so the first layout pass is
@@ -5057,11 +5096,18 @@ struct TVHomeView: View {
                 return
             }
             guard isActive else { return }
+            refreshWatchedTitles()
+            if usesRemoteProgress, selectedProgressSource == .trakt {
+                // Home remains mounted behind Details. Retire a completed
+                // Resume card immediately and fetch the now-eligible Next Up
+                // without waiting for the viewer to navigate Home again.
+                refreshRemoteContinueWatchingImmediately()
+                scheduleContinueWatchingRefresh()
+            }
             if isFullScreenOverlayPresented {
                 pendingContinueWatchingRefreshAfterOverlay = true
                 return
             }
-            refreshWatchedTitles()
             // A watched mark can be the only history left for a completed
             // series. Rebuild the local row so a newly aired episode can seed a
             // fresh "Airs Today" card even after the old row was retired.
@@ -5946,7 +5992,12 @@ struct TVHomeView: View {
     /// load. When returning from a card the sections are already cached in the
     /// store, so we render them straight away instead of flashing the spinner.
     private var showsLoading: Bool {
-        if collectionHome == nil { return !store.hasPresentedHome }
+        if collectionHome == nil {
+            // A usable catalog card is focusable as soon as the repository
+            // publishes it. Do not keep showing a spinner solely because
+            // remote Continue Watching has not finished refreshing.
+            return !store.hasPresentedHome && profileGateStartupFocusTarget == nil
+        }
         return isLoading
             && store.sections.isEmpty
             && continueWatching.isEmpty
@@ -6034,6 +6085,9 @@ struct TVHomeView: View {
     private func acknowledgeNativeProfileCardFocus(_ cardKey: String) {
         guard isProfileFocusPending else { return }
         didNativeFocusGridHero = false
+        if nativeProfileFocusedCardKey == nil {
+            TVPickerHomeSignposts.mark("HomeNativeCardFocusAcknowledged")
+        }
         nativeProfileFocusedCardKey = cardKey
         TVHomeDebugTrace.log("home.profileGate.nativeCardFocus key=\(cardKey) target=\(profileGateStartupFocusTarget?.signature ?? "none")")
         reportProfileGateReadiness()
@@ -7263,10 +7317,27 @@ struct TVHomeView: View {
         let collectionSections = await loadCollectionSections()
         guard store.isCurrentLoad(generation, for: identity) else { return }
         let homeVisibility = TVHomeCatalogOrder.homeVisibilityContext()
-        let previouslyLoadedCatalogSections = store.sections.filter {
+        var previouslyLoadedCatalogSections = store.sections.filter {
             !$0.isCollectionRow
                 && !$0.isLoadingPlaceholder
                 && isHomeCatalogSectionFromEnabledSource($0, context: homeVisibility)
+        }
+        // This snapshot holds catalog posters only. Progress, Next Up and
+        // watched history still come exclusively from their existing owners.
+        // An account/profile/config mismatch never restores any cached rows.
+        if previouslyLoadedCatalogSections.isEmpty,
+           let accountScope,
+           let cached = TVHomePresentationCache.restore(
+                accountScope: accountScope,
+                profileID: identity.profileId,
+                configuration: inputSignature
+           ) {
+            previouslyLoadedCatalogSections = cached.filter {
+                isHomeCatalogSectionFromEnabledSource($0, context: homeVisibility)
+            }
+            if !previouslyLoadedCatalogSections.isEmpty {
+                TVPickerHomeSignposts.mark("HomeCatalogSnapshotRestored")
+            }
         }
         let isColdStart = previouslyLoadedCatalogSections.isEmpty
         // Seeded before the first publish so Home shows its rows'
@@ -7333,6 +7404,17 @@ struct TVHomeView: View {
             )
             store.finishLoad(generation, for: identity)
             lastLoadedInputSignature = inputSignature
+            if receivedCatalogPublication,
+               !repository.homeCatalogLoadWasPartial,
+               let accountScope,
+               !latestCatalogSections.isEmpty {
+                TVHomePresentationCache.scheduleSave(
+                    rows: latestCatalogSections,
+                    accountScope: accountScope,
+                    profileID: identity.profileId,
+                    configuration: inputSignature
+                )
+            }
             // Arm this before clearing isLoading: a partial catalog retry can
             // otherwise reveal Home before the metadata recovery pass starts.
             if !store.hasPresentedHome {
@@ -8389,8 +8471,19 @@ struct TVHomeView: View {
 
     private func scheduleContinueWatchingRefresh() {
         guard collectionHome == nil else { return }
+        // Auth, Home appearance, and provider-change notifications can arrive
+        // in the same run-loop window. Collapse that burst into one remote
+        // refresh instead of cancelling and restarting network work repeatedly.
+        // The immediate local Infuse callback presentation happens separately;
+        // it is never held behind this short presentation-only debounce.
         continueWatchingRefreshTask?.cancel()
         continueWatchingRefreshTask = Task {
+            do {
+                try await Task.sleep(for: .milliseconds(80))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, isActive, collectionHome == nil else { return }
             await refreshContinueWatchingFromSelectedSource()
         }
     }

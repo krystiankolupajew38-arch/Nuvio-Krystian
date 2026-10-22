@@ -237,7 +237,7 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
             if let encodedFilename, !encodedFilename.isEmpty {
                 query += "&filename=\(encodedFilename)"
             }
-            if let position, position.isFinite, position >= 0 {
+            if let position, position.isFinite, position >= 0, position < Double(Int.max) {
                 query += "&position=\(Int(position))"
             }
             for sub in encodedSubs.prefix(8) {
@@ -520,8 +520,8 @@ struct ExternalPlaybackSession: Codable, Equatable {
     func sample(for callback: ExternalPlaybackCallback) -> (position: Double, duration: Double)? {
         guard !callback.isError, callback.id == id,
               !meta.isSeries || (season != nil && episode != nil) else { return nil }
-        // Legacy ledger durations have no measured/estimated provenance. Infuse
-        // seconds alone cannot prove completion against those historical runtimes.
+        // Historical ledger durations have no measured/estimated provenance.
+        // Only a duration returned by the player is trustworthy for Infuse.
         let runtime = callback.duration ?? (externalPlayerName == ExternalPlayer.infuse.rawValue ? nil : duration)
         let position = callback.position ?? callback.progress.flatMap { fraction in
             guard let runtime, runtime.isFinite, runtime >= 60 else { return nil }
@@ -719,7 +719,10 @@ enum ExternalPlaybackReturnHandler {
         let threshold = source == .mdblist && remote
             ? MdbListProgressService.completionPercent / 100 : WatchProgressLedger.completionFraction
         // A position-only callback has no trustworthy completion fraction.
-        let completed = duration >= 60 && position <= duration && position / duration >= threshold
+        let infuseWithTrakt = source == .trakt && session.externalPlayerName == ExternalPlayer.infuse.rawValue
+        // Infuse owns the Trakt watched event. A saved duration can display
+        // progress but must never create a duplicate watched scrobble.
+        let completed = !infuseWithTrakt && duration >= 60 && position <= duration && position / duration >= threshold
 
         // A later local or pulled sample wins over a delayed external return.
         // Matching values allow retry after a partially successful disk write.
@@ -727,17 +730,17 @@ enum ExternalPlaybackReturnHandler {
             if !remote, let row = WatchProgressLedger.record(contentId: session.meta.id, season: session.season, episode: session.episode),
                row.lastWatchedAt > startedAt,
                row.position != position && !(completed && row.position == duration) { return .superseded }
-            if source == .trakt, let row = TraktProgressService.currentContinueWatchingItem(for: session.meta),
-               row.season == session.season, row.episode == session.episode,
-               row.position > 0, row.lastWatchedAt > startedAt, row.position != position {
-                return .superseded
-            }
-            // A Trakt scrobble can arrive *during* this Infuse handoff and its
-            // approximate position may differ. It cannot invalidate the exact
-            // later callback merely because it has a newer pause timestamp.
-            if let row = WatchedStore.items().first(where: {
-                WatchedStore.sameContent($0.meta, session.meta) && $0.season == session.season && $0.episode == session.episode
-            }), row.watchedAt > startedAt,
+            // Trakt may scrobble in the middle of this same Infuse handoff.
+            // Its newer server timestamp does not supersede the final exact
+            // callback seconds; keep the callback authoritative on return.
+            // With Infuse + Trakt a watched event during this handoff is
+            // completion evidence, not proof of a later unrelated callback.
+            // Persist its exact seconds, then let session-aware reconciliation
+            // retire the now-complete handoff without a duplicate scrobble.
+            if !infuseWithTrakt,
+               let row = WatchedStore.items().first(where: {
+                   WatchedStore.sameContent($0.meta, session.meta) && $0.season == session.season && $0.episode == session.episode
+               }), row.watchedAt > startedAt,
                row.lastCountedPlaybackIDsBySource[source.rawValue] != session.id { return .superseded }
         }
 
@@ -768,7 +771,8 @@ enum ExternalPlaybackReturnHandler {
                 meta: session.meta, position: position, duration: duration,
                 season: session.season, episode: session.episode, source: source, notify: true,
                 preservesExactPosition: session.externalPlayerName == ExternalPlayer.infuse.rawValue,
-                recordedAt: session.returnedAt ?? Date()
+                recordedAt: session.returnedAt ?? Date(),
+                playbackStartedAt: session.startedAt
             ) else { return .retry }
             // Infuse scrobbles to the user's Trakt account independently.
             // Keep our immediate local checkpoint, but do not send a second

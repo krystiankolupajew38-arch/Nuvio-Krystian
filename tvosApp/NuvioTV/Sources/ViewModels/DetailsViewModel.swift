@@ -29,6 +29,10 @@ class DetailsViewModel: ObservableObject {
     private(set) var prefetchStartTime: Date?
 
     private let repository: CatalogRepository
+    /// Ephemeral, date-string-only source lookup for the current Details screen.
+    /// This is NOT diagnostic history. Allocated only when diagnostics are on,
+    /// capped to 256 episode entries, and discarded on the next title load.
+    private var diagnosticReleaseSources: [String: (addon: String?, tmdb: String?)] = [:]
     private let streamDiscoveryMode: DetailsStreamDiscoveryMode
     private var metadataTask: Task<Void, Never>?
     private var streamObserveTask: Task<Void, Never>?
@@ -74,6 +78,7 @@ class DetailsViewModel: ObservableObject {
     func loadDetails(id: String, type: String) -> Task<Void, Never> {
         TVHomeDebugTrace.log("details.load.begin id=\(id) type=\(type)")
         didLoadMetadataSuccessfully = false
+        diagnosticReleaseSources.removeAll(keepingCapacity: false)
         metadataLoadError = nil
         metadataTask?.cancel()
         deferredLoadTask?.cancel()
@@ -434,6 +439,19 @@ class DetailsViewModel: ObservableObject {
     private func applyTmdbEpisodes(_ episodes: [NuvioVideo]?, for metaId: String, generation: UInt64) {
         guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
         if let episodes, !episodes.isEmpty, let currentMeta = uiState.meta {
+            if ReleaseDateDiagnosticStore.shared.isEnabled {
+                var existingByKey: [String: String] = [:]
+                for video in currentMeta.videos ?? [] {
+                    if let value = video.released {
+                        existingByKey["\(video.season):\(video.episode)"] = value
+                    }
+                }
+                for episode in episodes.prefix(256) {
+                    let key = "\(episode.season):\(episode.episode)"
+                    let prior = diagnosticReleaseSources[key]?.addon ?? existingByKey[key]
+                    diagnosticReleaseSources[key] = (addon: prior, tmdb: episode.released)
+                }
+            }
             let mergedVideos = Self.mergeEpisodes(
                 existing: currentMeta.videos,
                 fromTmdb: episodes,
@@ -701,6 +719,25 @@ class DetailsViewModel: ObservableObject {
         applyMdbRatings(ratings, for: metaId, generation: detailsRequestGeneration)
     }
 
+    func inspectReleaseDate(for video: NuvioVideo) {
+        let store = ReleaseDateDiagnosticStore.shared
+        guard store.isEnabled, let meta = uiState.meta else { return }
+        let key = "\(video.season):\(video.episode)"
+        let rawFromRepository = repository.cachedMetadata(for: meta.id)?.videos?
+            .first(where: { $0.season == video.season && $0.episode == video.episode })?.released
+        let sources = diagnosticReleaseSources[key]
+        store.record(
+            showTitle: meta.name,
+            episode: video,
+            originalRelease: sources?.addon ?? rawFromRepository ?? (sources == nil ? video.released : nil),
+            tmdbRelease: sources?.tmdb,
+            provider: "Metadata provider name unavailable",
+            cacheStatus: didLoadMetadataSuccessfully
+                ? "Details loaded; provider cache status not exposed"
+                : "Cached Details preview; provider freshness unverified"
+        )
+    }
+
     static func mergeEpisodes(
         existing: [NuvioVideo]?,
         fromTmdb tmdbVideos: [NuvioVideo]?,
@@ -737,7 +774,7 @@ class DetailsViewModel: ObservableObject {
                     episode: ex.episode,
                     thumbnail: tmdb.thumbnail ?? ex.thumbnail,
                     overview: overviewToUse,
-                    released: tmdb.released ?? ex.released,
+                    released: EpisodeReleasePolicy.preferredRelease(primary: ex.released, fallback: tmdb.released),
                     rating: tmdb.rating ?? ex.rating
                 ))
             } else {

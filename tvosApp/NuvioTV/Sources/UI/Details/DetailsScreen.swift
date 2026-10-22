@@ -247,6 +247,7 @@ struct DetailsScreen: View {
                         }
                     },
                     onEpisodeSelected: { video in
+                        viewModel.inspectReleaseDate(for: video)
                         if creatingWatchPartyRoom, let meta = viewModel.uiState.meta {
                             onWatchPartyMediaSelected?(meta, video)
                             return
@@ -258,6 +259,7 @@ struct DetailsScreen: View {
                         startStreamFlow(streamId: streamId, type: "series", reload: !isPreFetched)
                     },
                     onEpisodePlayManually: { video in
+                        viewModel.inspectReleaseDate(for: video)
                         if creatingWatchPartyRoom, let meta = viewModel.uiState.meta {
                             onWatchPartyMediaSelected?(meta, video)
                             return
@@ -268,6 +270,7 @@ struct DetailsScreen: View {
                         let isPreFetched = (viewModel.prefetchedStreamId == streamId && !viewModel.uiState.streams.isEmpty)
                         startStreamFlow(streamId: streamId, type: "series", reload: !isPreFetched, forceManualPicker: true)
                     },
+                    onEpisodeInspectReleaseDate: { video in viewModel.inspectReleaseDate(for: video) },
                     onEpisodeMenuPresented: { isPresented in
                         isEpisodeMenuPresented = isPresented
                     },
@@ -2898,6 +2901,16 @@ enum StreamSortOption: String, CaseIterable, Identifiable {
 /// Pure stream-list derivation for the tvOS stream picker. Kept free of view
 /// state so focus movement cannot re-filter/sort, and unit tests can assert
 /// caching/identity behavior without mounting SwiftUI.
+enum StreamPickerFocusRecoveryPolicy {
+    static func canRestore(
+        visible: Bool, currentGeneration: UInt, requestedGeneration: UInt,
+        currentProfileID: String?, pickerProfileID: String?, focusedID: String?
+    ) -> Bool {
+        visible && currentGeneration == requestedGeneration
+            && currentProfileID == pickerProfileID && focusedID == nil
+    }
+}
+
 enum StreamPickerListBuilder {
     /// Streams for the current add-on filter, preserving group order when "All".
     static func sourceStreams(
@@ -2973,7 +2986,8 @@ enum StreamPickerListBuilder {
         sortOption: StreamSortOption,
         includeDebrid: Bool,
         cachedOnly: Bool = false,
-        preserveAddonStreams: Bool = false
+        preserveAddonStreams: Bool = false,
+        cachedFacts: ((NuvioStream) -> SortFacts)? = nil
     ) -> [NuvioStream] {
         let playable = playableStreams(
             streams: streams,
@@ -2983,7 +2997,7 @@ enum StreamPickerListBuilder {
             cachedOnly: cachedOnly,
             preserveAddonStreams: preserveAddonStreams
         )
-        return sorted(playable, by: sortOption, preserveAddonStreams: preserveAddonStreams)
+        return sorted(playable, by: sortOption, preserveAddonStreams: preserveAddonStreams, cachedFacts: cachedFacts)
     }
 
     /// Constant-size cache key. Repository revision captures every publication,
@@ -3018,51 +3032,87 @@ enum StreamPickerListBuilder {
     static func sorted(
         _ streams: [NuvioStream],
         by option: StreamSortOption,
-        preserveAddonStreams: Bool = false
+        preserveAddonStreams: Bool = false,
+        cachedFacts: ((NuvioStream) -> SortFacts)? = nil
     ) -> [NuvioStream] {
         if preserveAddonStreams && option == .default {
             return streams
         }
         // Action / informational items remain anchored at their returned positions,
         // while playable video streams are sorted around them.
-        let actionItemIndices = streams.enumerated().filter { $0.element.isNotPlayable }
-        if !actionItemIndices.isEmpty {
+        if streams.contains(where: \.isNotPlayable) {
             let playableOnly = streams.filter { !$0.isNotPlayable }
-            let sortedPlayable = sortPlayableStreams(playableOnly, by: option, preserveAddonStreams: preserveAddonStreams)
-            var result = sortedPlayable
-            for item in actionItemIndices {
-                let insertIndex = min(item.offset, result.count)
-                result.insert(item.element, at: insertIndex)
+            let sortedPlayable = sortPlayableStreams(
+                playableOnly, by: option,
+                preserveAddonStreams: preserveAddonStreams, cachedFacts: cachedFacts
+            )
+            // Keep helper/action cards at the exact provider positions, with
+            // sorted playable cards filling the remaining slots. Repeated
+            // Array.insert was quadratic for add-ons returning many actions.
+            var result: [NuvioStream] = []
+            result.reserveCapacity(streams.count)
+            var nextPlayable = sortedPlayable.makeIterator()
+            for original in streams {
+                if original.isNotPlayable {
+                    result.append(original)
+                } else if let playable = nextPlayable.next() {
+                    result.append(playable)
+                }
             }
             return result
         }
-        return sortPlayableStreams(streams, by: option, preserveAddonStreams: preserveAddonStreams)
+        return sortPlayableStreams(streams, by: option, preserveAddonStreams: preserveAddonStreams, cachedFacts: cachedFacts)
+    }
+
+    struct SortFacts {
+        let resolution: Int
+        let lowQuality: Bool
+        let quality: DebridStreamQuality
+        let size: Int64
+        let hardwareAccelerated: Bool
+
+        init(stream: NuvioStream) {
+            resolution = StreamPickerListBuilder.resolution(for: stream)
+            lowQuality = SmartPlaybackSelector.isLowQualityOrTicketStream(stream)
+            quality = StreamPickerListBuilder.streamQuality(for: stream)
+            size = StreamPickerListBuilder.sizeBytes(for: stream)
+            hardwareAccelerated = resolution >= 2160 && !AppleTVCapability.current.supportsAV1HardwareDecode
+                ? StreamQualityTags.parse(stream: stream).isHardwareAccelerated() : false
+        }
     }
 
     private static func sortPlayableStreams(
         _ streams: [NuvioStream],
         by option: StreamSortOption,
-        preserveAddonStreams: Bool = false
+        preserveAddonStreams: Bool = false,
+        cachedFacts: ((NuvioStream) -> SortFacts)? = nil
     ) -> [NuvioStream] {
         // Parse sort facts once per stream, not on every O(n log n) comparison.
         // Keep mode-specific work out of modes that do not use it.
         let needsResolution = !preserveAddonStreams || option == .quality || option == .default
         let needsHardwareCheck = option == .quality && !AppleTVCapability.current.supportsAV1HardwareDecode
-        let entries = streams.enumerated().map { entry in
-            let stream = entry.element
-            let resolutionValue = needsResolution ? resolution(for: stream) : 0
+        // Cancel superseded revisions before doing thousands of regex passes.
+        // The injected memo is owned by one background worker, never SwiftUI.
+        var entries: [(offset: Int, element: NuvioStream, resolution: Int,
+                       isBad: Bool, quality: DebridStreamQuality, size: Int64,
+                       hardwareAccelerated: Bool)] = []
+        entries.reserveCapacity(streams.count)
+        for (offset, stream) in streams.enumerated() {
+            if offset.isMultiple(of: 32) && Task<Never, Never>.isCancelled { return [] }
+            let facts = cachedFacts?(stream)
+            let resolutionValue = needsResolution ? (facts?.resolution ?? resolution(for: stream)) : 0
             let isBad = (!preserveAddonStreams || option == .default)
-                && (SmartPlaybackSelector.isLowQualityOrTicketStream(stream) || resolutionValue == 0)
-            return (
-                offset: entry.offset,
+                && ((facts?.lowQuality ?? SmartPlaybackSelector.isLowQualityOrTicketStream(stream)) || resolutionValue == 0)
+            entries.append((
+                offset: offset,
                 element: stream,
                 resolution: resolutionValue,
                 isBad: isBad,
-                quality: option == .quality ? streamQuality(for: stream) : DebridStreamQuality.unknown,
-                size: option == .quality || option == .size ? sizeBytes(for: stream) : 0,
+                quality: option == .quality ? (facts?.quality ?? streamQuality(for: stream)) : .unknown,
+                size: (option == .quality || option == .size) ? (facts?.size ?? sizeBytes(for: stream)) : 0,
                 hardwareAccelerated: needsHardwareCheck && resolutionValue >= 2160
-                    ? StreamQualityTags.parse(stream: stream).isHardwareAccelerated() : false
-            )
+                    ? (facts?.hardwareAccelerated ?? StreamQualityTags.parse(stream: stream).isHardwareAccelerated()) : false
+            ))
         }
 
         switch option {
@@ -3203,8 +3253,60 @@ struct StreamPickerListCacheKey: Equatable {
 actor StreamPickerListWorker {
     static let shared = StreamPickerListWorker()
 
-    func build(streams: [NuvioStream], groups: [AddonStreamGroup], key: StreamPickerListCacheKey) -> [NuvioStream] {
+    private struct Memo {
+        let fingerprint: Int
+        let facts: StreamPickerListBuilder.SortFacts
+    }
+    // FIFO bounded cache. All sort facts are reused across successive provider
+    // revisions and chip changes. Do not retain another profile's stream URLs.
+    private var factsByID: [String: Memo] = [:]
+    private var insertionOrder: [String] = []
+    private var cachedProfileID: String?
+    private let maximumFacts = 2_400
+
+    private func facts(for stream: NuvioStream) -> StreamPickerListBuilder.SortFacts {
+        var hasher = Hasher()
+        hasher.combine(stream.id)
+        hasher.combine(stream.name)
+        hasher.combine(stream.description)
+        hasher.combine(stream.filename)
+        hasher.combine(stream.videoSize)
+        hasher.combine(stream.isCached)
+        hasher.combine(stream.notPlayable)
+        let fingerprint = hasher.finalize()
+        if let entry = factsByID[stream.id], entry.fingerprint == fingerprint {
+            return entry.facts
+        }
+        let facts = StreamPickerListBuilder.SortFacts(stream: stream)
+        if factsByID[stream.id] == nil { insertionOrder.append(stream.id) }
+        factsByID[stream.id] = Memo(fingerprint: fingerprint, facts: facts)
+        if insertionOrder.count > maximumFacts {
+            let old = insertionOrder.removeFirst()
+            factsByID.removeValue(forKey: old)
+        }
+        return facts
+    }
+
+    func build(streams: [NuvioStream], groups: [AddonStreamGroup],
+               key: StreamPickerListCacheKey, profileID: String? = nil) -> [NuvioStream] {
         guard !Task.isCancelled else { return [] }
+        if cachedProfileID != profileID {
+            factsByID.removeAll(keepingCapacity: false)
+            insertionOrder.removeAll(keepingCapacity: false)
+            cachedProfileID = profileID
+        }
+        TVPickerHomeSignposts.mark("StreamListDerivationStarted")
+        defer { TVPickerHomeSignposts.mark("StreamListDerivationFinished") }
+        // Only Quality needs every parsed fact. Preserve the lighter parsing
+        // paths for Name, Size and Default, avoiding a cold-cache regression.
+        if key.sortOption == .quality {
+            return StreamPickerListBuilder.displayedStreams(
+                streams: streams, groups: groups, selectedAddonId: key.selectedAddonId,
+                sortOption: key.sortOption, includeDebrid: key.includeDebrid,
+                cachedOnly: key.cachedOnly, preserveAddonStreams: key.preserveAddonStreams,
+                cachedFacts: { stream in self.facts(for: stream) }
+            )
+        }
         return StreamPickerListBuilder.displayedStreams(
             streams: streams, groups: groups, selectedAddonId: key.selectedAddonId,
             sortOption: key.sortOption, includeDebrid: key.includeDebrid,
@@ -3303,6 +3405,7 @@ struct TvDetailsContent: View {
     var onHostWatchParty: (() -> Void)? = nil
     let onEpisodeSelected: (NuvioVideo) -> Void
     var onEpisodePlayManually: ((NuvioVideo) -> Void)? = nil
+    var onEpisodeInspectReleaseDate: ((NuvioVideo) -> Void)? = nil
     var onEpisodeMenuPresented: ((Bool) -> Void)? = nil
     let onWatchlistClick: () -> Void
     let onWatchedClick: () -> Void
@@ -3749,6 +3852,7 @@ struct TvDetailsContent: View {
                                         stopBackgroundTrailer(manual: false)
                                         onEpisodePlayManually?(video)
                                     } : nil,
+                                    onInspectReleaseDate: onEpisodeInspectReleaseDate,
                                     onEpisodeMenuPresented: { onEpisodeMenuPresented?($0) },
                                     onBack: handleDetailsBack,
                                     episodeFocus: $episodeFocus,
@@ -6854,6 +6958,7 @@ private struct TvDetailsEpisodes: View {
     let onFocus: () -> Void
     let onSelect: (NuvioVideo) -> Void
     var onPlayManually: ((NuvioVideo) -> Void)? = nil
+    var onInspectReleaseDate: ((NuvioVideo) -> Void)? = nil
     let onEpisodeMenuPresented: (Bool) -> Void
     var onBack: (() -> Void)? = nil
     var episodeFocus: FocusState<String?>.Binding
@@ -6889,6 +6994,7 @@ private struct TvDetailsEpisodes: View {
         onFocus: @escaping () -> Void,
         onSelect: @escaping (NuvioVideo) -> Void,
         onPlayManually: ((NuvioVideo) -> Void)? = nil,
+        onInspectReleaseDate: ((NuvioVideo) -> Void)? = nil,
         onEpisodeMenuPresented: @escaping (Bool) -> Void,
         onBack: (() -> Void)? = nil,
         episodeFocus: FocusState<String?>.Binding,
@@ -6906,6 +7012,7 @@ private struct TvDetailsEpisodes: View {
         self.onFocus = onFocus
         self.onSelect = onSelect
         self.onPlayManually = onPlayManually
+        self.onInspectReleaseDate = onInspectReleaseDate
         self.onEpisodeMenuPresented = onEpisodeMenuPresented
         self.onBack = onBack
         self.episodeFocus = episodeFocus
@@ -7126,6 +7233,7 @@ private struct TvDetailsEpisodes: View {
                                 isWatched: !isSeasonWatched
                             )
                         },
+                        onInspectReleaseDate: onInspectReleaseDate != nil ? { onInspectReleaseDate?(video) } : nil,
                         onMenuOpened: { onEpisodeMenuPresented(true) },
                         onMenuClosed: { onEpisodeMenuPresented(false) },
                         action: { onSelect(video) },
@@ -7309,6 +7417,7 @@ private struct TvEpisodeCard: View {
     let onToggleWatched: () -> Void
     let onMarkWatchedUpTo: () -> Void
     let onToggleSeasonWatched: () -> Void
+    var onInspectReleaseDate: (() -> Void)? = nil
     /// Called when a long press raises the context menu, and again when one of
     /// its items closes it — see the `.contextMenu` below.
     let onMenuOpened: () -> Void
@@ -7496,6 +7605,13 @@ private struct TvEpisodeCard: View {
                 onBack?()
             }
             .contextMenu {
+                if ReleaseDateDiagnosticStore.shared.isEnabled, let onInspectReleaseDate {
+                    Button {
+                        performAfterMenuDismissal(onInspectReleaseDate)
+                    } label: {
+                        Label("Inspect Release Date", systemImage: "calendar.badge.clock")
+                    }
+                }
                 if smartStreamSelection, let onPlayManually {
                     Button {
                         performAfterMenuDismissal(onPlayManually)
@@ -7828,6 +7944,9 @@ private struct TvStreamPickerOverlay: View {
     @State private var restoredSourceFocusID: String?
     @State private var pickerProfileID: String?
     @State private var pickerIsVisible = false
+    /// Invalidate delayed focus repair when a newer focus transition occurs
+    /// or the picker closes/reopens within the debounce window.
+    @State private var focusRecoveryGeneration: UInt = 0
     @State private var streamBadgeSettings = StreamBadgeSettingsStore.snapshot
     @State private var showRefreshToast = false
     @State private var isRefreshing = false
@@ -7959,7 +8078,9 @@ private struct TvStreamPickerOverlay: View {
             // lands on the All chip; seedStreamFocusIfNeeded hands focus to the
             // first card once results exist.
             .onAppear {
+                focusRecoveryGeneration &+= 1
                 pickerIsVisible = true
+                TVPickerHomeSignposts.mark("StreamPickerAppeared")
                 pickerProfileID = ProfileSettings.activeProfileID
                 seedInitialFocus()
                 if !didPresentInitialAvailabilityMessage {
@@ -7991,17 +8112,28 @@ private struct TvStreamPickerOverlay: View {
             // snaps focus back to the first stream (the reported bug), so we
             // debounce and bail when focus has already landed somewhere.
             .onChange(of: focusedItem) { _, newValue in
+                focusRecoveryGeneration &+= 1
+                let recoveryGeneration = focusRecoveryGeneration
                 visibleStreamLimit = StreamPickerListBuilder.limitAfterFocus(
                     newValue, streams: displayedStreams, currentLimit: visibleStreamLimit
                 )
                 if let newValue, newValue != filterAllKey, !didSeedStreamFocus {
+                    TVPickerHomeSignposts.mark("StreamPickerFirstFocusCandidate")
                     didSeedStreamFocus = true
                 }
                 guard newValue == nil else { return }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    if focusedItem == nil {
-                        seedInitialFocus()
-                    }
+                    // The delayed nil-focus recovery must not steal focus after
+                    // dismissal, profile change or another navigation event.
+                    guard StreamPickerFocusRecoveryPolicy.canRestore(
+                        visible: pickerIsVisible,
+                        currentGeneration: focusRecoveryGeneration,
+                        requestedGeneration: recoveryGeneration,
+                        currentProfileID: ProfileSettings.activeProfileID,
+                        pickerProfileID: pickerProfileID,
+                        focusedID: focusedItem
+                    ) else { return }
+                    seedInitialFocus()
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: StreamBadgeSettingsStore.changedNotification).receive(on: RunLoop.main)) { _ in
@@ -8010,6 +8142,7 @@ private struct TvStreamPickerOverlay: View {
                 streamBadgeSettingsRevision &+= 1
             }
             .onDisappear {
+                focusRecoveryGeneration &+= 1
                 pickerIsVisible = false
                 refreshToastTask?.cancel()
             }
@@ -8063,6 +8196,7 @@ private struct TvStreamPickerOverlay: View {
 
     private func select(_ stream: NuvioStream, player: ExternalPlayer?) {
         guard let reason = stream.unavailabilityReason else {
+            TVPickerHomeSignposts.mark("StreamPickerSelectionAccepted")
             onSelect(stream, player)
             return
         }
@@ -8083,7 +8217,8 @@ private struct TvStreamPickerOverlay: View {
             refreshedStreams = cachedStreams
         } else {
             refreshedStreams = await StreamPickerListWorker.shared.build(
-                streams: streams, groups: groups, key: key
+                streams: streams, groups: groups, key: key,
+                profileID: pickerProfileID
             )
         }
         guard !Task.isCancelled, key == listCacheKey, pickerIsVisible else { return }
@@ -8102,6 +8237,9 @@ private struct TvStreamPickerOverlay: View {
                 && previous.cachedOnly == key.cachedOnly
                 && previous.preserveAddonStreams == key.preserveAddonStreams
         } ?? false
+        if displayedStreamsCacheKey == nil && !refreshedStreams.isEmpty {
+            TVPickerHomeSignposts.mark("StreamPickerFirstPageReady")
+        }
         displayedStreams = refreshedStreams
         displayedStreamsCacheKey = key
         let focusedIndex = focusedItem.flatMap { id in refreshedStreams.firstIndex { $0.id == id } }
@@ -8127,9 +8265,11 @@ private struct TvStreamPickerOverlay: View {
         // batches reduce whole-overlay SwiftUI invalidations while still giving
         // cancellation a chance between chunks when a new revision arrives.
         var stagedPresentations = streamCardPresentations
-        for startIndex in stride(from: 0, to: missingStreams.count, by: 16) {
+        // Fewer medium-sized worker batches reduce actor round-trips and
+        // SwiftUI updates when an add-on publishes hundreds of sources.
+        for startIndex in stride(from: 0, to: missingStreams.count, by: 32) {
             guard !Task.isCancelled else { return }
-            let endIndex = min(startIndex + 16, missingStreams.count)
+            let endIndex = min(startIndex + 32, missingStreams.count)
             let batch = Array(missingStreams[startIndex..<endIndex])
             let batchPresentations = await TvStreamCardPresentationBuilder.shared.build(
                 streams: batch,
@@ -8138,7 +8278,9 @@ private struct TvStreamPickerOverlay: View {
             guard !Task.isCancelled,
                   cacheKey == streamCardPresentationCacheKey else { return }
             stagedPresentations.merge(batchPresentations) { _, new in new }
-            if startIndex == 0 || endIndex % 64 == 0 || endIndex == missingStreams.count {
+            if startIndex == 0 || endIndex == missingStreams.count {
+                // Show the first page promptly, then publish the remainder in
+                // one UI update instead of invalidating the focus tree mid-list.
                 streamCardPresentations = stagedPresentations
             }
         }

@@ -286,6 +286,52 @@ final class ExternalPlaybackReturnTests: XCTestCase {
         XCTAssertEqual(rewound.first?.position, 0)
     }
 
+    @MainActor
+    func testExactCallbackAtCompletionThresholdSurvivesUntilWatchedEvidence() {
+        let previous = ContinueWatchingStore.activeProfileId
+        ContinueWatchingStore.setActiveProfile("exact-threshold-\(UUID().uuidString)")
+        let meta = externalFixture().meta
+        defer {
+            TraktProgressService.forgetLocalPlayback(meta: meta, notify: false)
+            ContinueWatchingStore.setActiveProfile(previous)
+        }
+        XCTAssertTrue(TraktProgressService.recordLocalPlayback(meta: meta, position: 1950, duration: 2000,
+            season: 1, episode: 3, source: .trakt, notify: false, preservesExactPosition: true))
+        TraktProgressService.reloadCheckpointsForTesting()
+        let item = TraktProgressService.currentContinueWatchingItem(for: meta, source: .trakt)
+        XCTAssertEqual(item?.position, 1950)
+        XCTAssertEqual(item?.duration, 2000)
+    }
+
+    @MainActor
+    func testRecentPercentageOnlyEnrichesMatchingEpisodeAndDoesNotSpendExactCheckpoint() {
+        let previous = ContinueWatchingStore.activeProfileId
+        ContinueWatchingStore.setActiveProfile("exact-percent-\(UUID().uuidString)")
+        let meta = externalFixture().meta
+        defer {
+            TraktProgressService.forgetLocalPlayback(meta: meta, notify: false)
+            ContinueWatchingStore.setActiveProfile(previous)
+        }
+        let now = Date()
+        XCTAssertTrue(TraktProgressService.recordLocalPlayback(meta: meta, position: 700, duration: 0,
+            season: 1, episode: 3, source: .trakt, notify: false, preservesExactPosition: true, recordedAt: now))
+        for (offset, episode, expected) in [(-301.0, 3, nil as Double?), (-20.0, 4, nil), (-20.0, 3, 35.0), (10.0, 3, 35.0)] {
+            let remote = ContinueWatchingItem(meta: meta, streamUrl: "", position: 0, duration: 0,
+                lastWatchedAt: now.addingTimeInterval(offset), season: 1, episode: episode, explicitProgressPercent: 35)
+            let item = TraktProgressService.mergingLocalPlaybackCheckpoints(into: [remote], source: .trakt).first
+            XCTAssertEqual(item?.position, 700)
+            XCTAssertEqual(item?.duration, 0)
+            XCTAssertEqual(item?.explicitProgressPercent, expected)
+        }
+        TraktProgressService.reloadCheckpointsForTesting()
+        XCTAssertEqual(TraktProgressService.mergingLocalPlaybackCheckpoints(into: [], source: .trakt).first?.position, 700)
+    }
+
+    func testInfuseUnrepresentableResumeDoesNotTrap() {
+        let url = ExternalPlayer.infuse.launchURL(for: URL(string: "https://example.invalid/video")!, position: Double.greatestFiniteMagnitude)!
+        XCTAssertFalse(URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems!.contains { $0.name == "position" })
+    }
+
     func testExplicitInfuseRestartOverridesNativeResume() {
         let url = ExternalPlayer.infuse.launchURL(for: URL(string: "https://example.invalid/episode")!, position: 0)!
         let query = URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems!
@@ -322,6 +368,35 @@ final class ExternalPlaybackReturnTests: XCTestCase {
         XCTAssertTrue(TraktProgressService.mergingLocalPlaybackCheckpoints(into: [], source: .trakt).isEmpty)
         ContinueWatchingStore.setActiveProfile(profile)
         XCTAssertEqual(TraktProgressService.mergingLocalPlaybackCheckpoints(into: [], source: .trakt).first?.position, 700)
+    }
+
+    @MainActor
+    func testWatchedDuringInfuseSessionBeatsLaterCallbackButPriorWatchAllowsRewatch() {
+        let previous = ContinueWatchingStore.activeProfileId
+        let previousWatched = WatchedStore.activeProfileId
+        let profile = "infuse-watched-order-\(UUID().uuidString)"
+        ContinueWatchingStore.setActiveProfile(profile)
+        WatchedStore.setActiveProfile(profile)
+        let meta = externalFixture().meta
+        defer {
+            TraktProgressService.forgetLocalPlayback(meta: meta, notify: false)
+            WatchedStore.eraseProfile(profile)
+            WatchedStore.setActiveProfile(previousWatched)
+            ContinueWatchingStore.setActiveProfile(previous)
+        }
+        let now = Date()
+        let watched = WatchedStoreItem(meta: meta, watchedAt: now, season: 1, episode: 3, sources: [TraktWatchProgressSource.trakt.rawValue])
+        WatchedStore.replaceAll([watched])
+        for (startOffset, expectRetained) in [(-60.0, false), (1.0, true)] {
+            XCTAssertTrue(TraktProgressService.recordLocalPlayback(meta: meta, position: 1400, duration: 0,
+                season: 1, episode: 3, source: .trakt, notify: false, preservesExactPosition: true,
+                recordedAt: now.addingTimeInterval(10), playbackStartedAt: now.addingTimeInterval(startOffset)))
+            TraktProgressService.reloadCheckpointsForTesting()
+            let nextUp = ContinueWatchingItem(meta: meta, streamUrl: "", position: 0, duration: 0,
+                lastWatchedAt: now, season: 1, episode: 4, isUpNext: true)
+            let items = TraktProgressService.mergingLocalPlaybackCheckpoints(into: [nextUp], source: .trakt)
+            XCTAssertEqual(items.first?.episode, expectRetained ? 3 : 4)
+        }
     }
 
     @MainActor

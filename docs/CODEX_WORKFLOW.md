@@ -1,5 +1,9 @@
 # Nuvio-K local build workflow
 
+Current preparation branch: `fix/infuse-progress-ui-stream-picker-performance`.
+The helper rejects other branches for preparation; deployment still requires a
+separate explicit human GO.
+
 Begin a session with:
 
 ```sh
@@ -20,7 +24,7 @@ It reports compact results and keeps full command output in private local logs.
 | `generate` | Regenerate only if manifest, source inventory or dependency inputs changed |
 | `build` | Incremental unsigned simulator development build |
 | `test` | Run registered unit tests on an available tvOS simulator |
-| `prepare` | Incremental signed generic tvOS build, verification and development IPA packaging; reuse only after checks |
+| `prepare` | Request fresh app/Top Shelf profiles, incrementally sign/build, verify and package a new development IPA |
 | `verify` | Recheck registered artifact hashes, app/extension identities, signing, certificate dates and provisioning |
 | `clean --cache simulator --confirm-clean` | Remove only the selected managed DerivedData cache; keep prepared artifacts and evidence |
 
@@ -82,6 +86,26 @@ SHA. Changing application inputs invalidates build/artifact results; changing
 tests invalidates test results. A source edit during a command rejects its result.
 A failed build/test clears prior success. Only an executed, nonempty test run is
 reported as passing, and its selected scope is retained.
+
+Preparation now always requests fresh provisioning; it no longer returns a cached
+IPA from `prepare`. Only exact development profiles for the configured team and
+`com.krystian.nuvio` / `com.krystian.nuvio.TopShelf` are moved from the Mac
+profile cache into restricted private backups. Unrelated and wildcard profiles
+are not moved, and certificates are not revoked. Xcode builds with
+`-allowProvisioningUpdates`. Both embedded profiles must have creation dates
+within five minutes of the attempt and at least six days remaining. Old profiles
+returned by Apple cause a clear failure, not a renewal claim. On failure, missing
+cache entries are restored without overwriting new profiles. Private recovery
+mappings are retained under `profile-backups`. This never changes the physical
+Apple TV; its installed app only benefits after a separately approved update.
+
+Use `verify` or `report` to inspect an existing candidate without requesting
+renewal. A strict signature failure on generated incremental output triggers one
+clean rebuild and full re-verification. Identity, entitlement and provisioning
+failures are not bypassed or retried by that fallback.
+
+Application/test fingerprints still permit reusing test evidence and
+compiled intermediates after helper/documentation changes.
 
 Prepared apps have a recursive SHA-256 covering relative paths, modes and file
 contents; IPAs have a file SHA-256. Reuse checks both. Signing verification checks

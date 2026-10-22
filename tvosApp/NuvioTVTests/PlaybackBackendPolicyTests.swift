@@ -5104,6 +5104,36 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
         )
     }
 
+    func testMissingNextUpReleaseDateFallbackDoesNotAssertAired() {
+        let settings = ProfileSettings.current
+        let previous = settings.object(forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+        settings.set(false, forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+        defer {
+            if let previous {
+                settings.set(previous, forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+            } else {
+                settings.removeObject(forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+            }
+        }
+        for candidateSeason in [1, 2] {
+            XCTAssertTrue(EpisodeReleasePolicy.shouldSurfaceNextEpisode(
+                watchedSeason: 1, candidateSeason: candidateSeason, released: nil
+            ))
+            XCTAssertTrue(EpisodeReleasePolicy.shouldSurfaceNextEpisode(
+                watchedSeason: 1, candidateSeason: candidateSeason, released: "  "
+            ))
+            XCTAssertFalse(EpisodeReleasePolicy.shouldSurfaceNextEpisode(
+                watchedSeason: 1, candidateSeason: candidateSeason, released: "invalid"
+            ))
+            XCTAssertFalse(EpisodeReleasePolicy.shouldSurfaceNextEpisode(
+                watchedSeason: 1, candidateSeason: candidateSeason, released: "2099-01-01"
+            ))
+        }
+        XCTAssertEqual(EpisodeReleasePolicy.releaseState(nil), .unknown)
+        XCTAssertFalse(EpisodeReleasePolicy.hasAired(nil))
+        XCTAssertFalse(EpisodeReleasePolicy.isRecentlyReleased(nil, within: 60))
+    }
+
     func testContinueWatchingNextUpSortMovesSuggestionsFirst() {
         let now = Date()
         let resume = ContinueWatchingItem(
@@ -5133,7 +5163,7 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
 
     /// A drop that landed while the viewer was away is news.
     func testUpNextBadgeReadsNewEpisodeWhenTheDropFollowedTheSeedWatch() {
-        let item = makeUpNextItem(released: isoDay(daysAgo: 5), watchedDaysAgo: 30)
+        let item = makeUpNextItem(released: releaseInstant(daysAgo: 5), watchedDaysAgo: 30)
         XCTAssertEqual(item.upNextBadgeText, "NEW EPISODE")
     }
 
@@ -5141,14 +5171,14 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
     /// previous one is a backlog entry, so it must read "Next Up" even though it
     /// aired inside the release-alert window.
     func testUpNextBadgeReadsNextUpWhenTheEpisodeWasOutBeforeTheSeedWatch() {
-        let item = makeUpNextItem(released: isoDay(daysAgo: 40), watchedDaysAgo: 2)
+        let item = makeUpNextItem(released: releaseInstant(daysAgo: 40), watchedDaysAgo: 2)
         XCTAssertEqual(item.upNextBadgeText, "NEXT UP")
     }
 
     /// Outside the window nothing is news, whatever the watch history says.
     func testUpNextBadgeReadsNextUpForAnEpisodeOlderThanTheAlertWindow() {
         let item = makeUpNextItem(
-            released: isoDay(daysAgo: EpisodeReleasePolicy.newEpisodeWindowDays + 10),
+            released: releaseInstant(daysAgo: EpisodeReleasePolicy.newEpisodeWindowDays + 10),
             watchedDaysAgo: 400
         )
         XCTAssertEqual(item.upNextBadgeText, "NEXT UP")
@@ -5157,7 +5187,7 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
     /// A drop that opens a later season than the one being watched says so.
     func testUpNextBadgeReadsNewSeasonWhenTheDropCrossesASeason() {
         let item = makeUpNextItem(
-            released: isoDay(daysAgo: 5),
+            released: releaseInstant(daysAgo: 5),
             watchedDaysAgo: 30,
             season: 3,
             episode: 1,
@@ -5170,7 +5200,7 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
     /// rollover, not just an episode 1.
     func testUpNextBadgeStaysNewEpisodeWithinTheSameSeason() {
         let item = makeUpNextItem(
-            released: isoDay(daysAgo: 5),
+            released: releaseInstant(daysAgo: 5),
             watchedDaysAgo: 30,
             season: 3,
             episode: 7,
@@ -5182,7 +5212,7 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
     /// A card persisted before the seed season was recorded must not guess at a
     /// rollover; it falls back to the plain drop badge.
     func testUpNextBadgeWithoutASeedSeasonDoesNotClaimANewSeason() {
-        let item = makeUpNextItem(released: isoDay(daysAgo: 5), watchedDaysAgo: 30, season: 3, episode: 1)
+        let item = makeUpNextItem(released: releaseInstant(daysAgo: 5), watchedDaysAgo: 30, season: 3, episode: 1)
         XCTAssertEqual(item.upNextBadgeText, "NEW EPISODE")
     }
 
@@ -5190,7 +5220,7 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
     /// jump the "New Season" queue either.
     func testUpNextBadgeDoesNotClaimANewSeasonOutsideTheAlertWindow() {
         let item = makeUpNextItem(
-            released: isoDay(daysAgo: EpisodeReleasePolicy.newEpisodeWindowDays + 10),
+            released: releaseInstant(daysAgo: EpisodeReleasePolicy.newEpisodeWindowDays + 10),
             watchedDaysAgo: 400,
             season: 3,
             episode: 1,
@@ -5263,7 +5293,7 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
         let drop = makeSortItem(
             id: "drop",
             lastWatchedAt: Date().addingTimeInterval(-86_400 * 200),
-            released: isoDay(daysAgo: 1),
+            released: releaseInstant(daysAgo: 1),
             isUpNext: true
         )
         let watched = makeSortItem(
@@ -5368,7 +5398,7 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
     /// A drop is ordered by its air date, so a show returning today outranks a
     /// title watched yesterday instead of sinking to the seed's age.
     func testNewEpisodeDropSortsByItsAirDateRatherThanTheSeedWatch() {
-        let drop = makeUpNextItem(released: isoDay(daysAgo: 1), watchedDaysAgo: 200)
+        let drop = makeUpNextItem(released: releaseInstant(daysAgo: 1), watchedDaysAgo: 200)
         let recentlyWatched = ContinueWatchingItem(
             meta: makeDatedMeta(id: "resume", released: "2026-01-01"),
             streamUrl: "",
@@ -5387,16 +5417,16 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
     /// The same promotion applies among suggestions, where the up-next-first rule
     /// cannot be what decides the order.
     func testNewEpisodeDropOutranksAFresherPlainSuggestion() {
-        let drop = makeUpNextItem(released: isoDay(daysAgo: 1), watchedDaysAgo: 200)
+        let drop = makeUpNextItem(released: releaseInstant(daysAgo: 1), watchedDaysAgo: 200)
         let backlog = ContinueWatchingItem(
-            meta: makeDatedMeta(id: "backlog", released: isoDay(daysAgo: 90)),
+            meta: makeDatedMeta(id: "backlog", released: releaseInstant(daysAgo: 90)),
             streamUrl: "",
             position: 1,
             duration: 1_800,
             lastWatchedAt: Date().addingTimeInterval(-86_400 * 3),
             season: 1,
             episode: 4,
-            released: isoDay(daysAgo: 90),
+            released: releaseInstant(daysAgo: 90),
             isUpNext: true
         )
 
@@ -5407,8 +5437,32 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
     /// Only a drop is promoted: a plain Next Up still sorts on the watch time, or
     /// every stale suggestion would climb the row on its episode's release date.
     func testPlainNextUpKeepsSortingByWatchTime() {
-        let backlog = makeUpNextItem(released: isoDay(daysAgo: 10), watchedDaysAgo: 2)
+        let backlog = makeUpNextItem(released: releaseInstant(daysAgo: 10), watchedDaysAgo: 2)
         XCTAssertEqual(backlog.recencySortDate, backlog.lastWatchedAt)
+    }
+
+    func testDateOnlyNextUpDoesNotClaimNewReleaseOrReceiveRecencyBoost() {
+        let recent = makeSortItem(id: "recent", lastWatchedAt: Date().addingTimeInterval(-86_400))
+        for seedSeason in [2, 3] {
+            let undatedTime = makeUpNextItem(
+                released: isoDay(daysAgo: 5), watchedDaysAgo: 30,
+                season: 3, episode: 1, seedSeason: seedSeason
+            )
+            XCTAssertEqual(undatedTime.upNextBadgeText, "NEXT UP")
+            XCTAssertEqual(undatedTime.recencySortDate, undatedTime.lastWatchedAt)
+            for preference in ["Recently watched", "Streaming Style"] {
+                XCTAssertEqual(
+                    ContinueWatchingSortPolicy.sorted([undatedTime, recent], preference: preference).map(\.meta.id),
+                    ["recent", "series"]
+                )
+            }
+        }
+    }
+
+    /// Explicit zoned fixture for confirmed broadcasts; date-only fixtures
+    /// remain separate so tests cannot invent a broadcast instant from a day.
+    private func releaseInstant(daysAgo: Int) -> String {
+        ISO8601DateFormatter().string(from: Date().addingTimeInterval(-86_400 * Double(daysAgo)))
     }
 
     private func makeUpNextItem(

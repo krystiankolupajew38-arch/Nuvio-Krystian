@@ -1,10 +1,10 @@
 # Nuvio-K development workflow
 
 Start with `python3 scripts/krystian_build.py status --json`. Read
-`docs/CODEX_WORKFLOW.md` for details. Reuse current verified artifacts and scoped
-test evidence; never present stale results as validating changed source.
+`docs/CODEX_WORKFLOW.md` for details. Inspect current artifacts with verify/report; prepare requests fresh provisioning.
+Reuse scoped test evidence; never present stale results as validating changed source.
 
-- Work on `fix/infuse-return-progress-reliability` for this preparation. Do not
+- Work on `fix/infuse-progress-ui-stream-picker-performance` for this preparation. Do not
   merge into main, force-push, or integrate experimental upstream PR #308.
 - Treat physical Apple TV work as preparation-only unless the human explicitly
   authorizes deployment. Building or passing tests is not authorization.

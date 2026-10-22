@@ -19,7 +19,7 @@ import time
 import uuid
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
-BRANCH = 'fix/infuse-return-progress-reliability'
+BRANCH = 'fix/infuse-progress-ui-stream-picker-performance'
 BUNDLE = 'com.krystian.nuvio'
 GROUP = 'group.com.krystian.nuvio'
 APP_NAME = 'Nuvio - Krystian'
@@ -312,11 +312,86 @@ class Builder:
         require(re.fullmatch(r'[A-Za-z0-9-]+', config['device_id']), 'Invalid private device configuration.')
         return config
 
+    @staticmethod
+    def profile_directories():
+        return [pathlib.Path.home() / 'Library/Developer/Xcode/UserData/Provisioning Profiles',
+                pathlib.Path.home() / 'Library/MobileDevice/Provisioning Profiles']
+
+    def read_profile(self, path):
+        raw, _ = self.runner.run(['security', 'cms', '-D', '-i', str(path)],
+                                 'Provisioning inspection', capture=True)
+        try:
+            return plistlib.loads(raw[raw.index(b'<?xml'):])
+        except (ValueError, plistlib.InvalidFileException):
+            raise BuildError('Provisioning profile could not be decoded.') from None
+
+    @contextlib.contextmanager
+    def fresh_provisioning(self):
+        """Prompt automatic signing using only this fork's exact cached profiles.
+
+        Backups remain private. No certificate revocation, wildcard profile,
+        unrelated bundle, or physical-device operation is part of this flow.
+        """
+        config = self.config()
+        expected = {config['team_id'] + '.' + BUNDLE,
+                    config['team_id'] + '.' + BUNDLE + '.TopShelf'}
+        backup = self.root / 'profile-backups' / uuid.uuid4().hex
+        secure_dir(backup)
+        moved = []
+        started = dt.datetime.now(dt.timezone.utc)
+        self.state['provisioning_refresh'] = {'status': 'PENDING', 'started_utc': started.isoformat()}
+        self.save()
+        try:
+            for parent in self.profile_directories():
+                require(not parent.is_symlink(), 'Unsafe provisioning cache directory.')
+                for path in sorted(parent.glob('*.mobileprovision')):
+                    require(not path.is_symlink(), 'Unsafe provisioning cache entry.')
+                    profile = self.read_profile(path)
+                    entitlements = profile.get('Entitlements', {})
+                    if (profile.get('TeamIdentifier') != [config['team_id']]
+                            or entitlements.get('application-identifier') not in expected
+                            or entitlements.get('get-task-allow') is not True):
+                        continue
+                    destination = backup / (str(len(moved)) + '.mobileprovision')
+                    # Record the recovery mapping before moving any cached file.
+                    write_json(backup / 'recovery.json', {
+                        'profiles': [{'original': str(a), 'backup': str(b)} for a, b in moved + [(path, destination)]]})
+                    shutil.move(str(path), str(destination))
+                    destination.chmod(0o600)
+                    moved.append((path, destination))
+            yield started
+        except BaseException:
+            for original, saved in moved:
+                # Never overwrite a profile Xcode wrote while attempting renewal.
+                if not original.exists():
+                    shutil.copy2(saved, original)
+                    original.chmod(0o600)
+            self.state['provisioning_refresh']['status'] = 'FAILED'
+            self.save()
+            raise
+        else:
+            self.state['provisioning_refresh']['status'] = 'PASS'
+            self.save()
+
+    def require_fresh_profiles(self, app, started):
+        now = dt.datetime.now(dt.timezone.utc)
+        for bundle in [app, app / 'PlugIns/TopShelf.appex']:
+            profile = self.read_profile(bundle / 'embedded.mobileprovision')
+            created = profile.get('CreationDate')
+            expires = profile.get('ExpirationDate')
+            require(isinstance(created, dt.datetime) and isinstance(expires, dt.datetime),
+                    'Provisioning freshness dates are unavailable.')
+            created = created.replace(tzinfo=dt.timezone.utc)
+            expires = expires.replace(tzinfo=dt.timezone.utc)
+            require(started - dt.timedelta(minutes=5) <= created <= now + dt.timedelta(minutes=5),
+                    'Xcode did not return freshly issued profiles; preparation stopped. Check Xcode account provisioning.')
+            require(expires >= now + dt.timedelta(days=6),
+                    'Fresh provisioning has less than six days remaining; preparation stopped.')
+
     def signing_context(self):
         config = self.config()
         hasher = hashlib.sha256(json.dumps(config, sort_keys=True).encode())
-        for parent in [pathlib.Path.home() / 'Library/Developer/Xcode/UserData/Provisioning Profiles',
-                       pathlib.Path.home() / 'Library/MobileDevice/Provisioning Profiles']:
+        for parent in self.profile_directories():
             for path in sorted(parent.glob('*.mobileprovision')):
                 hasher.update(path.read_bytes())
         raw, _ = self.runner.run(['security', 'find-identity', '-v', '-p', 'codesigning'], 'Signing inventory')
@@ -350,6 +425,7 @@ class Builder:
             'tests': {key: tests['counts'][key] for key in ('total', 'passed', 'failed', 'skipped') if type(tests['counts'].get(key)) is int} if self.current(tests, 'tests') and tests.get('passed') else 'STALE_OR_UNAVAILABLE',
             'test_scope': [item if re.fullmatch(r'NuvioTVTests(?:/[A-Za-z_][A-Za-z0-9_]*){1,2}|ALL_REGISTERED_UNIT_TESTS', item) else '[private]' for item in tests.get('suite', [])] if tests else [], 'signing': signing_status,
             'artifact': artifact_status, 'artifact_location': '<private-build-home>/prepared' if prepared else None,
+            'provisioning_refresh': self.state.get('provisioning_refresh', {}).get('status', 'NOT_REQUESTED'),
             'deployment': 'NOT PERFORMED BY BUILD HELPER',
         }
         return result
@@ -492,22 +568,32 @@ class Builder:
             self.save()
         return result
 
+    def build_preparation_candidate(self, clean, started):
+        built = self.root / 'derived-data/device/Build/Products/Debug-appletvos/NuvioTV.app'
+        self.build(clean=clean, device=True)
+        try:
+            self.verify(built)
+        except BuildError as error:
+            # Generated incremental output can retain stale resource seals.
+            # Retry only that signature failure, once, with a clean build.
+            # Never retry away identity, entitlement, expiry or checksum failures.
+            if clean or not str(error).startswith('Signature verification: failed (exit '):
+                raise
+            self.build(clean=True, device=True)
+            self.verify(built)
+        self.require_fresh_profiles(built, started)
+        return built
+
     def prepare(self, clean=False):
         self.config()
         require(self.source['branch'] == BRANCH, 'Preparation requires the development branch.')
         tests = self.state.get('tests')
         require(self.current(tests, 'tests') and tests.get('passed'),
                 'Run relevant simulator tests for current source before preparation.')
-        prior = self.state.get('prepared')
-        if not clean and self.current(prior):
-            result = self.verify()
-            prior['source'] = self.source
-            write_json(pathlib.Path(prior['app']).parents[1] / 'manifest.json', prior)
-            self.save()
-            return dict(result, artifact='REUSED_AFTER_VERIFICATION', location='<private-build-home>/prepared', deployment='NOT PERFORMED')
-        self.build(clean=clean, device=True)
-        built = self.root / 'derived-data/device/Build/Products/Debug-appletvos/NuvioTV.app'
-        self.verify(built)
+        # Preparation always requests fresh profiles; build intermediates remain
+        # reusable. Verification alone does not initiate account changes.
+        with self.fresh_provisioning() as started:
+            built = self.build_preparation_candidate(clean, started)
         candidate = self.root / 'prepared' / ('candidate-' + uuid.uuid4().hex[:12])
         secure_dir(candidate / 'Payload')
         app = candidate / 'Payload/NuvioTV.app'
@@ -521,7 +607,7 @@ class Builder:
         self.state['prepared'] = record
         write_json(candidate / 'manifest.json', record)
         self.save()
-        return dict(verification, artifact='PREPARED', location='<private-build-home>/prepared', deployment='NOT PERFORMED')
+        return dict(verification, artifact='PREPARED', provisioning_refresh='PASS', location='<private-build-home>/prepared', deployment='NOT PERFORMED')
 
 
 def parser():

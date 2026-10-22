@@ -12,6 +12,147 @@ import XCTest
 private enum TestStreamError: Error { case failed }
 
 final class StreamsDiscoveryTests: XCTestCase {
+    func testDelayedFocusRecoveryCannotStealFocusAfterReopenOrProfileSwitch() {
+        func allowed(
+            visible: Bool = true,
+            current: UInt = 3, scheduled: UInt = 3,
+            profile: String? = "first", pickerProfile: String? = "first",
+            focused: String? = nil
+        ) -> Bool {
+            StreamPickerFocusRecoveryPolicy.canRestore(
+                visible: visible, currentGeneration: current,
+                requestedGeneration: scheduled, currentProfileID: profile,
+                pickerProfileID: pickerProfile, focusedID: focused
+            )
+        }
+        XCTAssertTrue(allowed())
+        XCTAssertFalse(allowed(visible: false))
+        XCTAssertFalse(allowed(current: 4))
+        XCTAssertFalse(allowed(profile: "second"))
+        XCTAssertFalse(allowed(focused: "stream-2"))
+    }
+
+    func testSortedActionItemsKeepExactSlotsAcrossLargeMixedResults() {
+        let streams = (0..<2_000).map { index in
+            NuvioStream(
+                url: "https://example.invalid/\(index).mp4",
+                name: "1080p WEB-DL",
+                description: nil,
+                addonName: "Mixed",
+                videoSize: Int64(index + 1),
+                notPlayable: index.isMultiple(of: 3)
+            )
+        }
+        let sorted = StreamPickerListBuilder.sorted(streams, by: .size)
+        XCTAssertEqual(sorted.count, streams.count)
+        for index in streams.indices where streams[index].isNotPlayable {
+            XCTAssertEqual(sorted[index].id, streams[index].id)
+        }
+        let reorderedPlayable = sorted.filter { !$0.isNotPlayable }
+        XCTAssertEqual(
+            reorderedPlayable.map(\.id),
+            streams.filter { !$0.isNotPlayable }.reversed().map(\.id)
+        )
+    }
+
+    func testSortedActionsRemainInPlaceAtLeadingAndTrailingBoundaries() {
+        let first = NuvioStream(
+            url: "https://example.invalid/a", name: "Action",
+            description: nil, addonName: "Mixed", notPlayable: true
+        )
+        let low = NuvioStream(
+            url: "https://example.invalid/low.mp4", name: "1080p",
+            description: nil, addonName: "Mixed", videoSize: 1
+        )
+        let high = NuvioStream(
+            url: "https://example.invalid/high.mp4", name: "1080p",
+            description: nil, addonName: "Mixed", videoSize: 100
+        )
+        let last = NuvioStream(
+            url: "https://example.invalid/z", name: "Action",
+            description: nil, addonName: "Mixed", notPlayable: true
+        )
+        let result = StreamPickerListBuilder.sorted([first, low, high, last], by: .size)
+        XCTAssertEqual(result.map(\.id), [first.id, high.id, low.id, last.id])
+    }
+
+    func testUnavailableAndActionStreamsWaitForFinalProviderPresentation() {
+        let unavailable = NuvioStream(
+            url: "https://example.invalid/unavailable.mp4",
+            name: "Unavailable", description: nil, addonName: "Provider",
+            notPlayable: true
+        )
+        let direct = NuvioStream(
+            url: "https://example.invalid/direct.mp4",
+            name: "Direct", description: "1080p", addonName: "Provider"
+        )
+        let interim = DebridStreamPresentation.immediatelyPlayable([unavailable, direct])
+        XCTAssertEqual(interim.map(\.id), [direct.id])
+    }
+
+    func testPendingTorrentIsNeverInInitialDirectPublication() {
+        let direct = NuvioStream(
+            url: "https://example.com/play.m3u8",
+            name: "Direct", description: "1080p", addonName: "Provider"
+        )
+        let torrent = NuvioStream(
+            url: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            name: "Torrent", description: "1080p", addonName: "Provider",
+            infoHash: "0123456789abcdef0123456789abcdef01234567"
+        )
+        XCTAssertFalse(direct.isDebridResolvable)
+        XCTAssertTrue(torrent.isDebridResolvable)
+        let interim = DebridStreamPresentation.immediatelyPlayable([torrent, direct])
+        XCTAssertEqual(interim.map(\.id), [direct.id])
+    }
+
+
+    func testMemoisedPickerMatchesReferenceAtScaleAndAfterMetadataChange() async {
+        for count in [50, 500, 2_000] {
+            let initial = (0..<count).map {
+                NuvioStream(url: "https://example.invalid/stream/\($0).mp4",
+                            name: "\($0 % 2 == 0 ? "1080p WEB-DL" : "2160p REMUX")",
+                            description: "size \($0 % 7 + 1) GB", addonName: "A",
+                            videoSize: Int64($0 + 1))
+            }
+            for option in [StreamSortOption.quality, .size, .name, .default] {
+                let key = StreamPickerListBuilder.cacheKey(
+                    revision: UInt64(count), selectedAddonId: nil,
+                    sortOption: option, includeDebrid: false
+                )
+                let reference = StreamPickerListBuilder.displayedStreams(
+                    streams: initial, groups: [], selectedAddonId: nil,
+                    sortOption: option, includeDebrid: false
+                )
+                let first = await StreamPickerListWorker.shared.build(
+                    streams: initial, groups: [], key: key, profileID: "memo-test"
+                )
+                let second = await StreamPickerListWorker.shared.build(
+                    streams: initial, groups: [], key: key, profileID: "memo-test"
+                )
+                XCTAssertEqual(first.map(\.id), reference.map(\.id))
+                XCTAssertEqual(second.map(\.id), reference.map(\.id))
+            }
+            var changed = initial
+            changed[0] = NuvioStream(
+                url: "https://example.invalid/stream/0.mp4",
+                name: "480p CAM", description: "changed file size 2 MB",
+                addonName: "A", videoSize: 2
+            )
+            let key = StreamPickerListBuilder.cacheKey(
+                revision: UInt64(count + 1), selectedAddonId: nil,
+                sortOption: .quality, includeDebrid: false
+            )
+            let actual = await StreamPickerListWorker.shared.build(
+                streams: changed, groups: [], key: key, profileID: "memo-test"
+            )
+            let expected = StreamPickerListBuilder.displayedStreams(
+                streams: changed, groups: [], selectedAddonId: nil,
+                sortOption: .quality, includeDebrid: false
+            )
+            XCTAssertEqual(actual.map(\.id), expected.map(\.id))
+        }
+    }
 
     func testPaginationExpandsOnlyWhenFocusReachesCurrentPageEnd() {
         let streams = (0..<65).map { NuvioStream(url: "https://example.com/\($0).mp4", name: "Stream \($0)", description: nil, addonName: "Test") }
@@ -33,6 +174,46 @@ final class StreamsDiscoveryTests: XCTestCase {
         let key = StreamPickerListBuilder.cacheKey(revision: 1, selectedAddonId: "test", sortOption: .size, includeDebrid: false)
         let result = await StreamPickerListWorker.shared.build(streams: [], groups: groups, key: key)
         XCTAssertEqual(result.map(\.id), streams.reversed().map(\.id))
+    }
+
+    func testListWorkerAtSmallAndLargeProviderSizes() async {
+        for count in [50, 500, 2_000] {
+            let streams = (0..<count).map {
+                NuvioStream(url: "https://example.invalid/\($0).mp4", name: "1080p WEB-DL", description: nil, addonName: "Test", videoSize: Int64($0 + 1))
+            }
+            let groups = [AddonStreamGroup(addonId: "test", displayName: "Test", streams: streams, isLoading: false)]
+            let key = StreamPickerListBuilder.cacheKey(revision: UInt64(count), selectedAddonId: "test", sortOption: .size, includeDebrid: false)
+            let start = Date()
+            let result = await StreamPickerListWorker.shared.build(streams: [], groups: groups, key: key)
+            print("STREAM_LIST_BENCH count=\(count) milliseconds=\(Date().timeIntervalSince(start) * 1000)")
+            XCTAssertEqual(result.map(\.id), streams.reversed().map(\.id))
+            XCTAssertEqual(StreamPickerListBuilder.paginatedSlice(streams: result, limit: 20).count, 20)
+        }
+    }
+
+    func testConcurrentManifestConsumersShareRequestAndFailuresRetry() async {
+        actor Fetcher {
+            var calls = 0
+            func fetch() async -> StreamAddonManifest? {
+                calls += 1
+                try? await Task.sleep(nanoseconds: 20_000_000)
+                return nil
+            }
+        }
+        let cache = StreamManifestCache()
+        let fetcher = Fetcher()
+        let url = URL(string: "https://example.invalid/manifest.json")!
+        await withTaskGroup(of: StreamAddonManifest?.self) { group in
+            for _ in 0..<10 {
+                group.addTask { await cache.load(url: url) { await fetcher.fetch() } }
+            }
+            for await result in group { XCTAssertNil(result) }
+        }
+        let sharedCalls = await fetcher.calls
+        XCTAssertEqual(sharedCalls, 1)
+        _ = await cache.load(url: url) { await fetcher.fetch() }
+        let retriedCalls = await fetcher.calls
+        XCTAssertEqual(retriedCalls, 2)
     }
 
     func testStreamRequestRetryPolicyRetriesTransientErrorsOnly() {

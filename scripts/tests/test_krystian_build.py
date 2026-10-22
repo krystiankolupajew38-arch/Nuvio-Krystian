@@ -222,7 +222,7 @@ class BuildHelperTests(unittest.TestCase):
         b.config = mock.Mock(return_value={'team_id': 'TESTTEAM01', 'device_id': 'test-device'})
         app = self.root / 'NuvioTV.app'
         app.mkdir()
-        info = {'CFBundleIdentifier': kb.BUNDLE, 'CFBundleShortVersionString': '3.4.5', 'CFBundleVersion': '77',
+        info = {'CFBundleIdentifier': kb.BUNDLE, 'CFBundleShortVersionString': kb.version()[0], 'CFBundleVersion': kb.version()[1],
                 'CFBundleSupportedPlatforms': ['AppleTVOS'], 'CFBundleDisplayName': kb.APP_NAME,
                 'CFBundleURLTypes': [{'CFBundleURLSchemes': ['nuvio-krystian']}]}
         (app / 'Info.plist').write_bytes(plistlib.dumps(info))
@@ -310,7 +310,7 @@ class BuildHelperTests(unittest.TestCase):
         b.verify = mock.Mock()
         original = {'bundleIdentifier': 'Nuvio.Sideload', 'version': '3.4.5', 'bundleVersion': '76', 'url': 'original'}
         old = {'bundleIdentifier': kb.BUNDLE, 'version': '3.4.5', 'bundleVersion': '76'}
-        new = dict(old, bundleVersion='77')
+        new = dict(old, version=kb.version()[0], bundleVersion=kb.version()[1])
         return b, [old, original], [new, dict(original)]
 
     def test_installer_success_uses_only_expected_update_and_launch_with_mocked_tools(self):
@@ -365,6 +365,110 @@ class BuildHelperTests(unittest.TestCase):
             self.assertEqual(kb.main(['status', '--json']), 1)
         self.assertNotIn('private-person', output.getvalue())
         self.assertEqual(json.loads(output.getvalue())['status'], 'FAIL')
+
+    def test_incremental_signature_failure_gets_one_clean_retry_and_all_checks(self):
+        b = self.builder()
+        b.build = mock.Mock()
+        b.verify = mock.Mock(side_effect=[kb.BuildError('Signature verification: failed (exit 1); private log retained.'), {}])
+        b.require_fresh_profiles = mock.Mock()
+        started = kb.dt.datetime.now(kb.dt.timezone.utc)
+        app = b.build_preparation_candidate(False, started)
+        self.assertEqual(b.build.call_args_list, [mock.call(clean=False, device=True), mock.call(clean=True, device=True)])
+        self.assertEqual(b.verify.call_count, 2)
+        b.require_fresh_profiles.assert_called_once_with(app, started)
+
+    def test_clean_retry_does_not_bypass_other_checks_or_loop(self):
+        for clean, message in [(False, 'Signing team mismatch.'),
+                               (True, 'Signature verification: failed (exit 1); private log retained.')]:
+            b = self.builder()
+            b.build = mock.Mock()
+            b.verify = mock.Mock(side_effect=kb.BuildError(message))
+            b.require_fresh_profiles = mock.Mock()
+            with self.assertRaises(kb.BuildError):
+                b.build_preparation_candidate(clean, kb.dt.datetime.now(kb.dt.timezone.utc))
+            self.assertEqual(b.build.call_count, 1)
+            b.require_fresh_profiles.assert_not_called()
+
+    def provisioning_fixture(self):
+        b = self.builder()
+        b.config = mock.Mock(return_value={'team_id': 'TESTTEAM01', 'device_id': 'test-device'})
+        cache = self.root / 'profile-cache'
+        cache.mkdir()
+        b.profile_directories = mock.Mock(return_value=[cache])
+        profiles = {}
+        for name, team, bundle in [('app', 'TESTTEAM01', kb.BUNDLE),
+                                   ('extension', 'TESTTEAM01', kb.BUNDLE + '.TopShelf'),
+                                   ('original', 'TESTTEAM01', 'Nuvio.Sideload'),
+                                   ('wildcard', 'TESTTEAM01', '*'),
+                                   ('other-team', 'OTHERTEAM1', kb.BUNDLE)]:
+            path = cache / (name + '.mobileprovision')
+            path.write_bytes(name.encode())
+            profiles[path] = {'TeamIdentifier': [team], 'Entitlements': {
+                'application-identifier': team + '.' + bundle, 'get-task-allow': True}}
+        b.read_profile = mock.Mock(side_effect=lambda path: profiles[path])
+        return b, cache
+
+    def test_profile_refresh_moves_only_exact_fork_profiles(self):
+        b, cache = self.provisioning_fixture()
+        with b.fresh_provisioning():
+            self.assertFalse((cache / 'app.mobileprovision').exists())
+            self.assertFalse((cache / 'extension.mobileprovision').exists())
+            for name in ['original', 'wildcard', 'other-team']:
+                self.assertEqual((cache / (name + '.mobileprovision')).read_bytes(), name.encode())
+        self.assertEqual(b.state['provisioning_refresh']['status'], 'PASS')
+        self.assertEqual(len(list((self.root / 'profile-backups').glob('*/*.mobileprovision'))), 2)
+
+    def test_profile_refresh_failure_restores_backups_without_overwriting_new_profile(self):
+        b, cache = self.provisioning_fixture()
+        with self.assertRaises(kb.BuildError):
+            with b.fresh_provisioning():
+                (cache / 'app.mobileprovision').write_bytes(b'new-profile')
+                raise kb.BuildError('test renewal failure')
+        self.assertEqual((cache / 'app.mobileprovision').read_bytes(), b'new-profile')
+        self.assertEqual((cache / 'extension.mobileprovision').read_bytes(), b'extension')
+        self.assertEqual(b.state['provisioning_refresh']['status'], 'FAILED')
+
+    def test_profile_refresh_rejects_symlink_cache(self):
+        b, cache = self.provisioning_fixture()
+        link = self.root / 'linked-cache'
+        link.symlink_to(cache, target_is_directory=True)
+        b.profile_directories.return_value = [link]
+        with self.assertRaisesRegex(kb.BuildError, 'Unsafe provisioning'):
+            with b.fresh_provisioning():
+                self.fail('Must reject a symlink before moving profiles')
+        self.assertTrue((cache / 'app.mobileprovision').exists())
+
+    def test_fresh_profile_checks_both_targets_and_rejects_old_or_short_lived_profiles(self):
+        b = self.builder()
+        now = kb.dt.datetime.now(kb.dt.timezone.utc)
+        fresh = {'CreationDate': now, 'ExpirationDate': now + kb.dt.timedelta(days=7)}
+        app = self.root / 'app'
+        b.read_profile = mock.Mock(return_value=fresh)
+        b.require_fresh_profiles(app, now)
+        self.assertEqual(b.read_profile.call_count, 2)
+        for invalid in [dict(fresh, CreationDate=now - kb.dt.timedelta(days=2)),
+                        dict(fresh, ExpirationDate=now + kb.dt.timedelta(days=5)),
+                        {'ExpirationDate': fresh['ExpirationDate']}]:
+            b.read_profile.side_effect = [fresh, invalid]
+            with self.assertRaises(kb.BuildError):
+                b.require_fresh_profiles(app, now)
+
+    def test_prepare_never_reuses_artifact_without_renewal(self):
+        b = self.builder()
+        b.state['tests'] = {'source': b.source, 'toolchain': b.toolchain, 'passed': True}
+        b.state['prepared'] = {'source': b.source, 'toolchain': b.toolchain}
+        with mock.patch.object(b, 'config'), mock.patch.object(b, 'fresh_provisioning', side_effect=kb.BuildError('renewal requested')) as refresh:
+            with self.assertRaisesRegex(kb.BuildError, 'renewal requested'):
+                b.prepare()
+            refresh.assert_called_once()
+
+    def test_prepare_rejects_old_branch_before_build(self):
+        self.assertEqual(kb.BRANCH, 'fix/infuse-progress-ui-stream-picker-performance')
+        b = self.builder()
+        b.source['branch'] = 'fix/infuse-return-progress-reliability'
+        with mock.patch.object(b, 'config'), mock.patch.object(b, 'build') as build, self.assertRaisesRegex(kb.BuildError, 'development branch'):
+            b.prepare()
+        build.assert_not_called()
 
     def test_prepare_requires_current_test_evidence(self):
         b = self.builder()
