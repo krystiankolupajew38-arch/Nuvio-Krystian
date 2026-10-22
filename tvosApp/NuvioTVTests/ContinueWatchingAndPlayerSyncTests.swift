@@ -2403,10 +2403,9 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
             season: 1,
             episode: 9
         )
-        let releaseFormatter = DateFormatter()
-        releaseFormatter.calendar = Calendar(identifier: .gregorian)
-        releaseFormatter.timeZone = .current
-        releaseFormatter.dateFormat = "yyyy-MM-dd"
+        // This merge test needs a confirmed new release to exercise the
+        // recency override. Calendar-only dates cannot establish that instant.
+        let releaseFormatter = ISO8601DateFormatter()
         let recentRelease = Calendar.current.date(byAdding: .day, value: -1, to: now)!
         let highRecencyMemoryOnly = ContinueWatchingItem(
             meta: memoryOnlyMeta,
